@@ -3,6 +3,8 @@
 **Modern Kubernetes visibility.**
 <br>Local-first. No account. No cloud dependency. Blazing Fast.
 
+🌐 **[radarhq.io](https://radarhq.io)** · [Docs](https://radarhq.io/docs) · [Releases](https://github.com/skyhook-io/radar/releases)
+
 Topology, event timeline, and service traffic — plus resource browsing, Helm management, and GitOps support for FluxCD and ArgoCD.
 
 [![CI](https://github.com/skyhook-io/radar/actions/workflows/ci.yml/badge.svg)](https://github.com/skyhook-io/radar/actions/workflows/ci.yml)
@@ -383,6 +385,14 @@ make watch-backend
 ## Contributing
 
 Contributions are welcome! Please read our [Contributing Guide](CONTRIBUTING.md) for details on the development workflow, pull request process, and coding standards.
+
+---
+
+## About
+
+Radar is built and maintained by [Skyhook](https://skyhook.io) (YC W23) and is open source under Apache-2.0. The OSS version is fully featured and the recommended way to run Radar.
+
+For teams that want hosted multi-cluster Radar with SSO and shared dashboards, we also offer [Radar Cloud](https://radarhq.io).
 
 ---
 

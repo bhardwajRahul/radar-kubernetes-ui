@@ -1,13 +1,20 @@
 package helm
 
-import "testing"
+import (
+	"testing"
+
+	"helm.sh/helm/v3/pkg/chart"
+	"helm.sh/helm/v3/pkg/release"
+	helmtime "helm.sh/helm/v3/pkg/time"
+)
 
 func TestFindBestUpgradeVersion(t *testing.T) {
 	tests := []struct {
-		name            string
-		candidates      []repoVersionInfo
-		wantVersion     string
-		wantRepo        string
+		name        string
+		candidates  []repoVersionInfo
+		sourceHosts []string
+		wantVersion string
+		wantRepo    string
 	}{
 		{
 			name:        "no candidates returns empty",
@@ -33,15 +40,6 @@ func TestFindBestUpgradeVersion(t *testing.T) {
 			wantRepo:    "metallb",
 		},
 		{
-			name: "multiple repos none has current version - falls back to highest",
-			candidates: []repoVersionInfo{
-				{repoName: "bitnami", latestVersion: "6.4.22", hasCurrentVersion: false},
-				{repoName: "metallb", latestVersion: "0.15.3", hasCurrentVersion: false},
-			},
-			wantVersion: "6.4.22",
-			wantRepo:    "bitnami",
-		},
-		{
 			name: "multiple repos both have current version - picks highest among them",
 			candidates: []repoVersionInfo{
 				{repoName: "repo-a", latestVersion: "2.0.0", hasCurrentVersion: true},
@@ -59,11 +57,58 @@ func TestFindBestUpgradeVersion(t *testing.T) {
 			wantVersion: "1.2.0",
 			wantRepo:    "official",
 		},
+		{
+			name: "ambiguous chart-name collision without affinity - bail out",
+			candidates: []repoVersionInfo{
+				{repoName: "bitnami", latestVersion: "6.4.22", hasCurrentVersion: false, repoURL: "https://charts.bitnami.com/bitnami"},
+				{repoName: "argo", latestVersion: "8.5.0", hasCurrentVersion: false, repoURL: "https://argoproj.github.io/argo-helm"},
+			},
+			wantVersion: "",
+			wantRepo:    "",
+		},
+		{
+			name: "single candidate without current version - accept (stale index case)",
+			candidates: []repoVersionInfo{
+				{repoName: "argo", latestVersion: "8.5.0", hasCurrentVersion: false, repoURL: "https://argoproj.github.io/argo-helm"},
+			},
+			wantVersion: "8.5.0",
+			wantRepo:    "argo",
+		},
+		{
+			name: "source-affinity host match picks correct repo",
+			candidates: []repoVersionInfo{
+				{repoName: "bitnami", latestVersion: "6.4.22", hasCurrentVersion: false, repoURL: "https://charts.bitnami.com/bitnami"},
+				{repoName: "argo", latestVersion: "8.5.0", hasCurrentVersion: false, repoURL: "https://argoproj.github.io/argo-helm"},
+			},
+			sourceHosts: []string{"argoproj.github.io"},
+			wantVersion: "8.5.0",
+			wantRepo:    "argo",
+		},
+		{
+			name: "source-affinity registered-domain match (charts.bitnami.com vs bitnami.com)",
+			candidates: []repoVersionInfo{
+				{repoName: "bitnami", latestVersion: "12.0.0", hasCurrentVersion: false, repoURL: "https://charts.bitnami.com/bitnami"},
+				{repoName: "argo", latestVersion: "8.5.0", hasCurrentVersion: false, repoURL: "https://argoproj.github.io/argo-helm"},
+			},
+			sourceHosts: []string{"bitnami.com"},
+			wantVersion: "12.0.0",
+			wantRepo:    "bitnami",
+		},
+		{
+			name: "source-affinity hosts present but none match - bail out",
+			candidates: []repoVersionInfo{
+				{repoName: "bitnami", latestVersion: "6.4.22", hasCurrentVersion: false, repoURL: "https://charts.bitnami.com/bitnami"},
+				{repoName: "argo", latestVersion: "8.5.0", hasCurrentVersion: false, repoURL: "https://argoproj.github.io/argo-helm"},
+			},
+			sourceHosts: []string{"github.com"}, // chart-declared, but not the repo's host
+			wantVersion: "",
+			wantRepo:    "",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotVersion, gotRepo := findBestUpgradeVersion(tt.candidates)
+			gotVersion, gotRepo := findBestUpgradeVersion(tt.candidates, tt.sourceHosts)
 			if gotVersion != tt.wantVersion {
 				t.Errorf("findBestUpgradeVersion() version = %q, want %q", gotVersion, tt.wantVersion)
 			}
@@ -71,6 +116,147 @@ func TestFindBestUpgradeVersion(t *testing.T) {
 				t.Errorf("findBestUpgradeVersion() repo = %q, want %q", gotRepo, tt.wantRepo)
 			}
 		})
+	}
+}
+
+func TestChartSourceHosts(t *testing.T) {
+	tests := []struct {
+		name    string
+		home    string
+		sources []string
+		want    []string
+	}{
+		{
+			name: "empty inputs",
+			want: nil,
+		},
+		{
+			name: "bitnami home only",
+			home: "https://bitnami.com",
+			want: []string{"bitnami.com"},
+		},
+		{
+			name: "subdomain expands to registered domain",
+			home: "https://charts.bitnami.com",
+			want: []string{"charts.bitnami.com", "bitnami.com"},
+		},
+		{
+			name:    "deduplicates across home and sources",
+			home:    "https://github.com/argoproj/argo-helm",
+			sources: []string{"https://github.com/argoproj/argo-cd"},
+			want:    []string{"github.com", "argoproj.github.io"},
+		},
+		{
+			name: "argo-cd realistic chart metadata derives argoproj.github.io",
+			home: "https://github.com/argoproj/argo-helm",
+			want: []string{"github.com", "argoproj.github.io"},
+		},
+		{
+			name: "github.io chart home does not seed bare github.io (multi-tenant)",
+			home: "https://argoproj.github.io",
+			want: []string{"argoproj.github.io"},
+		},
+		{
+			name: "ipv4 host does not seed a bogus registered domain",
+			home: "http://127.0.0.1:8080/charts",
+			want: []string{"127.0.0.1"},
+		},
+		{
+			name:    "skips invalid urls",
+			sources: []string{"not a url", "ftp://", ""},
+			want:    nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := chartSourceHosts(tt.home, tt.sources)
+			if !equalStringSlices(got, tt.want) {
+				t.Errorf("chartSourceHosts() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRepoURLMatchesAny(t *testing.T) {
+	tests := []struct {
+		name    string
+		repoURL string
+		hosts   []string
+		want    bool
+	}{
+		{name: "empty repo url", repoURL: "", hosts: []string{"bitnami.com"}, want: false},
+		{name: "empty hosts", repoURL: "https://charts.bitnami.com", hosts: nil, want: false},
+		{name: "exact host match", repoURL: "https://argoproj.github.io/argo-helm", hosts: []string{"argoproj.github.io"}, want: true},
+		{name: "registered-domain match", repoURL: "https://charts.bitnami.com/bitnami", hosts: []string{"bitnami.com"}, want: true},
+		{name: "no match", repoURL: "https://charts.bitnami.com", hosts: []string{"argoproj.github.io"}, want: false},
+		{name: "github.io is multi-tenant: unrelated github.io repos do not match each other", repoURL: "https://kubernetes-sigs.github.io/external-dns", hosts: []string{"argoproj.github.io"}, want: false},
+		{name: "oci registry host match", repoURL: "oci://registry-1.docker.io/bitnamicharts/argo-cd", hosts: []string{"docker.io"}, want: true},
+		{name: "https with explicit port", repoURL: "https://charts.example.com:8443/charts", hosts: []string{"example.com"}, want: true},
+		{name: "https with userinfo", repoURL: "https://user:pass@charts.bitnami.com/bitnami", hosts: []string{"bitnami.com"}, want: true},
+		{name: "invalid url", repoURL: "://broken", hosts: []string{"bitnami.com"}, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := repoURLMatchesAny(tt.repoURL, tt.hosts); got != tt.want {
+				t.Errorf("repoURLMatchesAny(%q, %v) = %v, want %v", tt.repoURL, tt.hosts, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMarkCurrentVersion_DoesNotMutateBaseOrLeakAcrossReleases(t *testing.T) {
+	base := []repoVersionInfo{
+		{repoName: "bitnami", latestVersion: "20.0.0"},
+		{repoName: "argo", latestVersion: "8.5.0"},
+	}
+	versions := map[string][]string{
+		"bitnami": {"19.0.0", "20.0.0"},
+		"argo":    {"8.4.0", "8.5.0"},
+	}
+
+	a := markCurrentVersion(base, versions, "20.0.0")
+	b := markCurrentVersion(base, versions, "8.5.0")
+
+	if !a[0].hasCurrentVersion || a[1].hasCurrentVersion {
+		t.Errorf("release A: bitnami should match, argo should not; got %+v", a)
+	}
+	if b[0].hasCurrentVersion || !b[1].hasCurrentVersion {
+		t.Errorf("release B: argo should match, bitnami should not; got %+v", b)
+	}
+	if base[0].hasCurrentVersion || base[1].hasCurrentVersion {
+		t.Errorf("base slice was mutated; per-release flags would leak across releases sharing a chart name: %+v", base)
+	}
+}
+
+func TestToHelmRelease_StorageNamespace(t *testing.T) {
+	rel := &release.Release{
+		Name:      "podinfo",
+		Namespace: "demo-flux-helm",
+		Version:   1,
+		Info: &release.Info{
+			Status:       release.StatusDeployed,
+			LastDeployed: helmtime.Unix(0, 0),
+		},
+		Chart: &chart.Chart{Metadata: &chart.Metadata{
+			Name:       "podinfo",
+			Version:    "6.11.2",
+			AppVersion: "6.11.2",
+		}},
+	}
+
+	same := toHelmRelease(rel, "demo-flux-helm")
+	if same.StorageNamespace != "" {
+		t.Fatalf("same storage namespace should be omitted, got %q", same.StorageNamespace)
+	}
+
+	different := toHelmRelease(rel, "flux-system")
+	if different.Namespace != "demo-flux-helm" {
+		t.Fatalf("target namespace changed: got %q", different.Namespace)
+	}
+	if different.StorageNamespace != "flux-system" {
+		t.Fatalf("storage namespace = %q, want flux-system", different.StorageNamespace)
 	}
 }
 
@@ -95,4 +281,16 @@ func TestCompareVersions(t *testing.T) {
 			}
 		})
 	}
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

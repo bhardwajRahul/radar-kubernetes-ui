@@ -3,6 +3,7 @@ package k8s
 import (
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 // Problem is a transport-neutral cluster issue.
@@ -27,6 +29,15 @@ type Problem struct {
 	AgeSeconds      int64  // for sorting
 	Duration        string // how long the problem has persisted
 	DurationSeconds int64
+	// RestartCount + LastTerminatedReason are populated for Pod problems where
+	// the kubelet has recorded crash data. Together they answer the two
+	// questions an agent needs about a CrashLoopBackOff in one read:
+	// chronic-vs-acute (RestartCount: 2 vs 2000) and what kind of failure
+	// (Reason: OOMKilled / Error / Completed — disambiguates memory pressure
+	// from app bug from misconfigured-as-long-running). Zero / empty values
+	// mean either non-Pod problem or no crash data on this Pod yet.
+	RestartCount         int32
+	LastTerminatedReason string
 }
 
 // DetectProblems scans workloads in cache and returns detected problems.
@@ -148,6 +159,114 @@ func DetectProblems(cache *ResourceCache, namespace string) []Problem {
 		}
 	}
 
+	podsByNamespace := listPodsByNamespace(cache, namespace)
+
+	// Pod problems: high-signal container waiting/terminated states, old
+	// Pending pods, and restart-heavy pods. These are useful direct pointers
+	// even when a controller-level problem also exists.
+	for _, pods := range podsByNamespace {
+		for _, pod := range pods {
+			health := ClassifyPodHealth(pod, now)
+			if health == "healthy" {
+				continue
+			}
+			ageDur := now.Sub(pod.CreationTimestamp.Time)
+			severity := "high"
+			if health == "error" {
+				severity = "critical"
+			}
+			restartCount, lastTermReason := PodRestartContext(pod)
+			problems = append(problems, Problem{
+				Kind:                 "Pod",
+				Namespace:            pod.Namespace,
+				Name:                 pod.Name,
+				Severity:             severity,
+				Reason:               PodProblemReason(pod),
+				Age:                  FormatAge(ageDur),
+				AgeSeconds:           int64(ageDur.Seconds()),
+				Duration:             FormatAge(ageDur),
+				DurationSeconds:      int64(ageDur.Seconds()),
+				RestartCount:         restartCount,
+				LastTerminatedReason: lastTermReason,
+			})
+		}
+	}
+
+	// Service problems: routing health that workload .status often misses.
+	// EndpointSlice would be the strongest source for realized backend state,
+	// but the typed cache intentionally does not watch noisy endpoint resources
+	// today. Use selector -> Pod readiness here, and keep the targetPort check
+	// conservative: only named targetPorts are flagged as unresolved.
+	if svcLister := cache.Services(); svcLister != nil {
+		var services []*corev1.Service
+		if namespace != "" {
+			services, _ = svcLister.Services(namespace).List(labels.Everything())
+		} else {
+			services, _ = svcLister.List(labels.Everything())
+		}
+		for _, svc := range services {
+			if svc.Spec.Type == corev1.ServiceTypeExternalName || len(svc.Spec.Selector) == 0 {
+				continue
+			}
+			selected := podsMatchingService(svc, podsByNamespace[svc.Namespace])
+			ageDur := now.Sub(svc.CreationTimestamp.Time)
+			if len(selected) == 0 {
+				// Warning, not critical: a Service with zero matching pods
+				// is often intentional (scaled-to-zero workload, dormant
+				// staging environment, just-deployed Service waiting for
+				// its workload to apply). The "0/N selected but 0 ready"
+				// case below stays critical — that's a real routing break
+				// because the workload is up but unhealthy.
+				problems = append(problems, Problem{
+					Kind:            "Service",
+					Namespace:       svc.Namespace,
+					Name:            svc.Name,
+					Severity:        "warning",
+					Reason:          "Selector matches no pods",
+					Message:         selectorMessage(svc.Spec.Selector),
+					Age:             FormatAge(ageDur),
+					AgeSeconds:      int64(ageDur.Seconds()),
+					Duration:        FormatAge(ageDur),
+					DurationSeconds: int64(ageDur.Seconds()),
+				})
+				continue
+			}
+			ready := 0
+			for _, pod := range selected {
+				if isPodReadyForProblem(pod) {
+					ready++
+				}
+			}
+			if ready == 0 {
+				problems = append(problems, Problem{
+					Kind:            "Service",
+					Namespace:       svc.Namespace,
+					Name:            svc.Name,
+					Severity:        "critical",
+					Reason:          fmt.Sprintf("0/%d selected pods ready", len(selected)),
+					Age:             FormatAge(ageDur),
+					AgeSeconds:      int64(ageDur.Seconds()),
+					Duration:        FormatAge(ageDur),
+					DurationSeconds: int64(ageDur.Seconds()),
+				})
+			}
+			if missing := unresolvedNamedTargetPorts(svc, selected); len(missing) > 0 {
+				problems = append(problems, Problem{
+					Kind:            "Service",
+					Namespace:       svc.Namespace,
+					Name:            svc.Name,
+					Severity:        "high",
+					Reason:          fmt.Sprintf("Unresolved named targetPort: %s", strings.Join(missing, ", ")),
+					Message:         "No selected pod declares a container port with this name",
+					Age:             FormatAge(ageDur),
+					AgeSeconds:      int64(ageDur.Seconds()),
+					Duration:        FormatAge(ageDur),
+					DurationSeconds: int64(ageDur.Seconds()),
+				})
+			}
+		}
+	}
+
 	// HPA problems
 	if hpaLister := cache.HorizontalPodAutoscalers(); hpaLister != nil {
 		var hpas []*autoscalingv2.HorizontalPodAutoscaler
@@ -157,12 +276,20 @@ func DetectProblems(cache *ResourceCache, namespace string) []Problem {
 			hpas, _ = hpaLister.List(labels.Everything())
 		}
 		for _, hp := range DetectHPAProblems(hpas) {
+			// "cannot-scale" is critical (HPA inert; workload's scaling
+			// guarantees silently broken). "maxed" stays medium (HPA is
+			// working; signal is that the ceiling was hit, which may or
+			// may not be a problem depending on intent).
+			severity := "medium"
+			if hp.Problem == "cannot-scale" {
+				severity = "critical"
+			}
 			problems = append(problems, Problem{
 				Kind:      "HorizontalPodAutoscaler",
 				Namespace: hp.Namespace,
 				Name:      hp.Name,
 				Group:     "autoscaling",
-				Severity:  "medium",
+				Severity:  severity,
 				Reason:    hp.Problem,
 				Message:   hp.Reason,
 			})
@@ -213,7 +340,7 @@ func DetectProblems(cache *ResourceCache, namespace string) []Problem {
 		}
 	}
 
-	// PVC problems: stuck in Pending phase
+	// PVC problems: stuck in Pending phase or Lost bound volume.
 	if pvcLister := cache.PersistentVolumeClaims(); pvcLister != nil {
 		var pvcs []*corev1.PersistentVolumeClaim
 		if namespace != "" {
@@ -222,8 +349,23 @@ func DetectProblems(cache *ResourceCache, namespace string) []Problem {
 			pvcs, _ = pvcLister.List(labels.Everything())
 		}
 		for _, pvc := range pvcs {
+			ageDur := now.Sub(pvc.CreationTimestamp.Time)
+			if pvc.Status.Phase == corev1.ClaimLost {
+				problems = append(problems, Problem{
+					Kind:            "PersistentVolumeClaim",
+					Namespace:       pvc.Namespace,
+					Name:            pvc.Name,
+					Severity:        "critical",
+					Reason:          "Lost",
+					Message:         "PVC has lost its bound volume",
+					Age:             FormatAge(ageDur),
+					AgeSeconds:      int64(ageDur.Seconds()),
+					Duration:        FormatAge(ageDur),
+					DurationSeconds: int64(ageDur.Seconds()),
+				})
+				continue
+			}
 			if pvc.Status.Phase == corev1.ClaimPending {
-				ageDur := now.Sub(pvc.CreationTimestamp.Time)
 				if ageDur > 5*time.Minute {
 					problems = append(problems, Problem{
 						Kind:            "PersistentVolumeClaim",
@@ -250,8 +392,32 @@ func DetectProblems(cache *ResourceCache, namespace string) []Problem {
 			jobs, _ = jobLister.List(labels.Everything())
 		}
 		for _, job := range jobs {
+			ageDur := now.Sub(job.CreationTimestamp.Time)
+			if cond := failedJobCondition(job); cond != nil {
+				durDur := ageDur
+				if !cond.LastTransitionTime.IsZero() {
+					durDur = now.Sub(cond.LastTransitionTime.Time)
+				}
+				reason := cond.Reason
+				if reason == "" {
+					reason = "Failed"
+				}
+				problems = append(problems, Problem{
+					Kind:            "Job",
+					Namespace:       job.Namespace,
+					Name:            job.Name,
+					Group:           "batch",
+					Severity:        "critical",
+					Reason:          reason,
+					Message:         cond.Message,
+					Age:             FormatAge(ageDur),
+					AgeSeconds:      int64(ageDur.Seconds()),
+					Duration:        FormatAge(durDur),
+					DurationSeconds: int64(durDur.Seconds()),
+				})
+				continue
+			}
 			if job.Status.Active > 0 && job.Status.Succeeded == 0 && job.Status.Failed == 0 {
-				ageDur := now.Sub(job.CreationTimestamp.Time)
 				if ageDur > time.Hour {
 					problems = append(problems, Problem{
 						Kind:            "Job",
@@ -271,6 +437,111 @@ func DetectProblems(cache *ResourceCache, namespace string) []Problem {
 	}
 
 	return problems
+}
+
+func listPodsByNamespace(cache *ResourceCache, namespace string) map[string][]*corev1.Pod {
+	out := make(map[string][]*corev1.Pod)
+	if cache == nil || cache.Pods() == nil {
+		return out
+	}
+	var pods []*corev1.Pod
+	if namespace != "" {
+		pods, _ = cache.Pods().Pods(namespace).List(labels.Everything())
+	} else {
+		pods, _ = cache.Pods().List(labels.Everything())
+	}
+	for _, pod := range pods {
+		out[pod.Namespace] = append(out[pod.Namespace], pod)
+	}
+	return out
+}
+
+func podsMatchingService(svc *corev1.Service, pods []*corev1.Pod) []*corev1.Pod {
+	if svc == nil || len(svc.Spec.Selector) == 0 {
+		return nil
+	}
+	selector := labels.SelectorFromSet(labels.Set(svc.Spec.Selector))
+	out := make([]*corev1.Pod, 0, len(pods))
+	for _, pod := range pods {
+		if selector.Matches(labels.Set(pod.Labels)) {
+			out = append(out, pod)
+		}
+	}
+	return out
+}
+
+func isPodReadyForProblem(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodReady {
+			return cond.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+func unresolvedNamedTargetPorts(svc *corev1.Service, pods []*corev1.Pod) []string {
+	if svc == nil || len(pods) == 0 {
+		return nil
+	}
+	declared := make(map[string]bool)
+	for _, pod := range pods {
+		for _, container := range pod.Spec.InitContainers {
+			addNamedContainerPorts(declared, container.Ports)
+		}
+		for _, container := range pod.Spec.Containers {
+			addNamedContainerPorts(declared, container.Ports)
+		}
+	}
+	var missing []string
+	seen := make(map[string]bool)
+	for _, port := range svc.Spec.Ports {
+		if port.TargetPort.Type != intstr.String || port.TargetPort.StrVal == "" {
+			continue
+		}
+		name := port.TargetPort.StrVal
+		if declared[name] || seen[name] {
+			continue
+		}
+		seen[name] = true
+		missing = append(missing, name)
+	}
+	return missing
+}
+
+func addNamedContainerPorts(dst map[string]bool, ports []corev1.ContainerPort) {
+	for _, port := range ports {
+		if port.Name != "" {
+			dst[port.Name] = true
+		}
+	}
+}
+
+func selectorMessage(selector map[string]string) string {
+	if len(selector) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(selector))
+	for k, v := range selector {
+		parts = append(parts, k+"="+v)
+	}
+	sort.Strings(parts)
+	return "selector: " + strings.Join(parts, ", ")
+}
+
+func failedJobCondition(job *batchv1.Job) *batchv1.JobCondition {
+	if job == nil {
+		return nil
+	}
+	for i := range job.Status.Conditions {
+		cond := &job.Status.Conditions[i]
+		if cond.Type == batchv1.JobFailed && cond.Status == corev1.ConditionTrue {
+			return cond
+		}
+	}
+	return nil
 }
 
 // DetectCAPIProblems scans Cluster API resources for problems.

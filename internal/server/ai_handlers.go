@@ -17,10 +17,11 @@
 // two protocols.
 //
 // Revisit this opt-out when:
-//   (a) the agent surface stabilizes (no major shape changes for two
-//       release cycles), AND
-//   (b) Skyhook commits to a public customer-facing AI SDK that needs
-//       generated bindings.
+//
+//	(a) the agent surface stabilizes (no major shape changes for two
+//	    release cycles), AND
+//	(b) Skyhook commits to a public customer-facing AI SDK that needs
+//	    generated bindings.
 //
 // Until both conditions are met, bringing /api/ai/* under openapi.yaml
 // is premature — it would pay the spec-authoring tax during evolution
@@ -35,7 +36,9 @@ import (
 	"strings"
 
 	"github.com/go-chi/chi/v5"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 
 	"github.com/skyhook-io/radar/internal/audit"
@@ -78,6 +81,17 @@ func (a policyReportLookupAdapter) FindingsFor(group, kind, namespace, name stri
 		}
 	}
 	return out
+}
+
+type serviceBackendLookup struct {
+	cache *k8s.ResourceCache
+}
+
+func (l serviceBackendLookup) PodsForServiceSelector(namespace string, selector labels.Selector) ([]*corev1.Pod, error) {
+	if l.cache == nil || l.cache.Pods() == nil {
+		return nil, nil
+	}
+	return l.cache.Pods().Pods(namespace).List(selector)
 }
 
 // parseVerbosity reads the ?verbosity= query parameter and returns the matching level.
@@ -410,10 +424,11 @@ func (s *Server) buildAIResourceContext(r *http.Request, obj runtime.Object, kin
 	auditSum := computeAuditSummaryForResource(cache, canonicalGroup, canonicalKind, namespace, name)
 
 	opts := resourcecontext.Options{
-		Tier:          resourcecontext.TierBasic,
-		AccessChecker: s.newRequestScopedChecker(r),
-		IssueSummary:  issueSum,
-		AuditSummary:  auditSum,
+		Tier:            resourcecontext.TierBasic,
+		AccessChecker:   s.newRequestScopedChecker(r),
+		IssueSummary:    issueSum,
+		AuditSummary:    auditSum,
+		ServiceBackends: serviceBackendLookup{cache: cache},
 	}
 
 	// Wire the PolicyReport index when Kyverno is installed. Build emits a
@@ -466,7 +481,7 @@ func (s *Server) topologyForContext(namespace string) (*topology.Topology, topol
 }
 
 // computeIssueSummaryForResource rolls up per-resource issue-composer rows
-// (problem + condition + optional audit) into an IssueSummary.
+// (problem + condition) into an IssueSummary.
 //
 // The composer is the canonical "what's wrong with this resource" surface —
 // it merges problem detection (Deployment/DS/etc.), pod-level conditions,
@@ -492,7 +507,14 @@ func computeIssueSummaryForResource(cache *k8s.ResourceCache, group, kind, names
 	}
 	filters := issues.Filters{
 		Kinds: []string{kind},
-		Limit: issues.MaxLimit,
+		// NoLimit (not MaxLimit): the post-compose filter narrows to a
+		// single {group, kind, ns, name}, so a hard cap before that
+		// filter can silently zero the per-resource summary on clusters
+		// where the kind has many same-namespace siblings whose issues
+		// outrank the target on (severity, last_seen). Mirrors the MCP
+		// sibling in internal/mcp/resource_context.go and the
+		// summarycontext.BuildIssueIndex rationale.
+		Limit: issues.NoLimit,
 	}
 	if namespace != "" {
 		filters.Namespaces = []string{namespace}
@@ -508,12 +530,10 @@ func computeIssueSummaryForResource(cache *k8s.ResourceCache, group, kind, names
 		if namespace != "" && row.Namespace != namespace {
 			continue
 		}
-		// Group-aware match: T11 populates Issue.Group for problem +
-		// condition sources, so a Knative serving.knative.dev/Service
-		// lookup won't pull in the core Service's issues (or vice
-		// versa). The fromAudit / fromEvent sources emit Group="" today
-		// — those correctly match only the core-group lookup, which is
-		// the existing behavior.
+		// Group-aware match: Issue.Group is populated for problem,
+		// condition, and event sources, so a Knative
+		// serving.knative.dev/Service lookup won't pull in the core
+		// Service's issues (or vice versa).
 		if row.Group != group {
 			continue
 		}
@@ -612,10 +632,8 @@ func computeAuditSummaryForResource(cache *k8s.ResourceCache, group, kind, names
 // scale ("critical" / "warning") used by issueSummary. Two sibling
 // fields in the same response reporting severity in different
 // vocabularies — "danger" vs "critical" — is a wire-shape footgun for
-// consumers. Mirrors the same mapping internal/issues.fromAudit
-// applies when audit findings flow through the unified issue stream.
-// Empty / unknown severities pass through unchanged so the contract
-// stays explicit if the audit suite ever grows new values.
+// consumers. Empty / unknown severities pass through unchanged so the
+// contract stays explicit if the audit suite ever grows new values.
 func normalizeAuditSeverity(s string) string {
 	switch s {
 	case bpaudit.SeverityDanger:

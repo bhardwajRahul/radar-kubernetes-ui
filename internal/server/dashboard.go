@@ -42,14 +42,15 @@ type DashboardResponse struct {
 	NetworkPolicyCoverage  *DashboardNetworkPolicyCoverage `json:"networkPolicyCoverage,omitempty"`
 	NodeVersionSkew        *k8s.VersionSkew                `json:"nodeVersionSkew,omitempty"`
 	Audit                  *DashboardAudit                 `json:"audit,omitempty"`
+	Visibility             *k8s.VisibilitySummary          `json:"visibility,omitempty"`
 	// GitOpsControllers summarizes Argo CD / Flux controller pod health.
 	// Omitted when no controllers are detected — the Home dashboard
 	// hides the card entirely on non-GitOps clusters rather than
 	// rendering an empty state.
-	GitOpsControllers      *DashboardGitOpsControllers     `json:"gitopsControllers,omitempty"`
-	DeferredLoading        bool                            `json:"deferredLoading,omitempty"`  // True while deferred informers (secrets, events, etc.) are still syncing
-	PartialData            []string                        `json:"partialData,omitempty"`      // Resource kinds that timed out during critical sync (e.g. ["Pod", "Deployment"])
-	AccessRestricted       bool                            `json:"accessRestricted,omitempty"` // True when user has no namespace access (RBAC)
+	GitOpsControllers *DashboardGitOpsControllers `json:"gitopsControllers,omitempty"`
+	DeferredLoading   bool                        `json:"deferredLoading,omitempty"`  // True while deferred informers (secrets, events, etc.) are still syncing
+	PartialData       []string                    `json:"partialData,omitempty"`      // Resource kinds that timed out during critical sync (e.g. ["Pod", "Deployment"])
+	AccessRestricted  bool                        `json:"accessRestricted,omitempty"` // True when user has no namespace access (RBAC)
 }
 
 // DashboardCRDsResponse is the response for CRD counts (loaded lazily)
@@ -329,6 +330,9 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := DashboardResponse{}
+	if result := k8s.GetCachedPermissionResult(); result != nil {
+		resp.Visibility = k8s.BuildVisibilitySummary(result, k8s.VisibilityNamespace(namespaces))
+	}
 	canReadNodes := s.canRead(r, "", "nodes", "", "list")
 	canReadNamespaces := s.canRead(r, "", "namespaces", "", "list")
 
@@ -598,8 +602,39 @@ func (s *Server) getDashboardHealth(cache *k8s.ResourceCache, namespace string) 
 	// Add orphan pod problems (no owner workload)
 	problems = append(problems, orphanProblems...)
 
-	// Workload/HPA/CronJob/Node problems (excluding pods, handled above)
-	for _, p := range k8s.DetectProblems(cache, namespace) {
+	// Workload/HPA/CronJob/Node problems (excluding pods, handled above) +
+	// direct dangling-ref errors (missing CM/Secret/PVC/SA refs, missing
+	// HPA target, missing Ingress backend / TLS / port, missing roleRef,
+	// missing StorageClass on a PVC, missing headless Service on a
+	// StatefulSet) + webhook-config refs (missing Service on
+	// Validating/MutatingWebhookConfiguration). Skip Pod-kind rows from
+	// DetectProblems — REST's pod rollup + orphan handling above is the
+	// canonical pod surface; including DetectProblems Pod rows would
+	// duplicate them. (Missing-ref Pod rows are intentionally kept: those
+	// catch pods stuck Pending on missing refs, which the pod-error loop
+	// above doesn't surface.)
+	detected := append(k8s.DetectProblems(cache, namespace), k8s.DetectMissingRefs(cache, namespace)...)
+	detected = append(detected, k8s.DetectMissingWebhookRefs(cache, k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery(), namespace)...)
+	// DetectProblems Pod rows duplicate REST's pod rollup above; skip them.
+	// DetectMissingRefs Pod rows are kept (different failure category — won't-
+	// schedule etc.). We can't tell the source from the Problem struct, so
+	// distinguish by whether Reason starts with "Missing " (only emitted by
+	// DetectMissingRefs at present). Dedupe keys by (ns, name, reason) so a
+	// Pod with multiple distinct missing-ref reasons (e.g. PVC + ConfigMap)
+	// keeps a row per blocker — agents triaging a Pending pod need ALL of
+	// the missing refs, not just whichever fired first.
+	seenPodReason := map[string]bool{}
+	for _, p := range detected {
+		if p.Kind == "Pod" {
+			if !strings.HasPrefix(p.Reason, "Missing ") {
+				continue
+			}
+			key := p.Namespace + "/" + p.Name + "/" + p.Reason
+			if seenPodReason[key] {
+				continue
+			}
+			seenPodReason[key] = true
+		}
 		problems = append(problems, DashboardProblem{
 			Kind:            p.Kind,
 			Namespace:       p.Namespace,
@@ -632,7 +667,10 @@ func (s *Server) getDashboardHealth(cache *k8s.ResourceCache, namespace string) 
 	}
 
 	// Sort: critical first, then high, then medium; within each group sort by age (most recent first)
-	severityOrder := map[string]int{"critical": 0, "high": 1, "medium": 2}
+	// "warning" is below medium — degraded states that aren't immediate
+	// failures. Listed explicitly so the Go zero-value (0) doesn't accidentally
+	// sort warnings ahead of critical when an unknown severity is encountered.
+	severityOrder := map[string]int{"critical": 0, "high": 1, "medium": 2, "warning": 3}
 	sort.SliceStable(problems, func(i, j int) bool {
 		si, sj := severityOrder[problems[i].Severity], severityOrder[problems[j].Severity]
 		if si != sj {
@@ -780,7 +818,7 @@ func collectPodForRollup(pod *corev1.Pod, severity string, now time.Time, groups
 
 	g.podCount++
 	// Keep worst severity: critical > high > medium
-	order := map[string]int{"critical": 0, "high": 1, "medium": 2}
+	order := map[string]int{"critical": 0, "high": 1, "medium": 2, "warning": 3}
 	if g.severity == "" || order[severity] < order[g.severity] {
 		g.severity = severity
 	}

@@ -12,7 +12,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/skyhook-io/radar/internal/k8s"
-	bp "github.com/skyhook-io/radar/pkg/audit"
 	"github.com/skyhook-io/radar/pkg/policyreports"
 )
 
@@ -21,8 +20,8 @@ import (
 // one of these and pass it to Compose.
 type fakeProvider struct {
 	problems     []k8s.Problem
+	missingRefs  []k8s.Problem
 	capiProblems []k8s.Problem
-	audit        []bp.Finding
 	events       []*corev1.Event
 	dynamic      map[schema.GroupVersionResource][]*unstructured.Unstructured
 	kinds        map[schema.GroupVersionResource]string
@@ -32,8 +31,8 @@ type fakeProvider struct {
 }
 
 func (f *fakeProvider) DetectProblems(_ []string) []k8s.Problem     { return f.problems }
+func (f *fakeProvider) DetectMissingRefs(_ []string) []k8s.Problem  { return f.missingRefs }
 func (f *fakeProvider) DetectCAPIProblems(_ []string) []k8s.Problem { return f.capiProblems }
-func (f *fakeProvider) AuditFindings(_ []string) []bp.Finding       { return f.audit }
 func (f *fakeProvider) WarningEvents(_ []string, _ time.Duration) []*corev1.Event {
 	return f.events
 }
@@ -82,33 +81,6 @@ func TestCompose_NormalizesProblemSeverity(t *testing.T) {
 	}
 }
 
-func TestCompose_AuditExcludedByDefault(t *testing.T) {
-	p := &fakeProvider{
-		problems: []k8s.Problem{
-			{Kind: "Pod", Name: "p", Severity: "critical", Reason: "x"},
-		},
-		audit: []bp.Finding{
-			{Kind: "Pod", Name: "p", CheckID: "no-resource-limits", Severity: bp.SeverityWarning, Message: "no limits"},
-		},
-	}
-	out := Compose(p, Filters{})
-	for _, i := range out {
-		if i.Source == SourceAudit {
-			t.Fatal("audit should be excluded by default")
-		}
-	}
-	out = Compose(p, Filters{IncludeAudit: true})
-	hasAudit := false
-	for _, i := range out {
-		if i.Source == SourceAudit {
-			hasAudit = true
-		}
-	}
-	if !hasAudit {
-		t.Fatal("audit should be included when IncludeAudit=true")
-	}
-}
-
 func TestCompose_WarningEventsIncluded(t *testing.T) {
 	now := time.Now()
 	p := &fakeProvider{
@@ -125,9 +97,9 @@ func TestCompose_WarningEventsIncluded(t *testing.T) {
 			},
 		},
 	}
-	// Events are opt-in (analogous to audit); IncludeEvents=true is
-	// required to surface them from Compose. The default-off behavior
-	// is covered separately by TestCompose_EventsExcludedByDefault.
+	// Events are opt-in; IncludeEvents=true is required to surface them
+	// from Compose. The default-off behavior is covered separately by
+	// TestCompose_EventsExcludedByDefault.
 	out := Compose(p, Filters{IncludeEvents: true})
 	if len(out) != 1 {
 		t.Fatalf("got %d issues", len(out))
@@ -142,8 +114,8 @@ func TestCompose_WarningEventsIncluded(t *testing.T) {
 
 func TestCompose_EventsExcludedByDefault(t *testing.T) {
 	// The default Compose call must NOT surface warning events. Pins
-	// the audit-style opt-in contract so a future refactor doesn't
-	// silently re-enable the event flood on noisy clusters.
+	// the opt-in contract so a future refactor doesn't silently
+	// re-enable the event flood on noisy clusters.
 	now := time.Now()
 	p := &fakeProvider{
 		events: []*corev1.Event{{

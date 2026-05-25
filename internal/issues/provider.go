@@ -8,9 +8,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
-	"github.com/skyhook-io/radar/internal/audit"
 	"github.com/skyhook-io/radar/internal/k8s"
-	bp "github.com/skyhook-io/radar/pkg/audit"
 	"github.com/skyhook-io/radar/pkg/policyreports"
 )
 
@@ -45,6 +43,25 @@ func (p *CacheProvider) DetectProblems(namespaces []string) []k8s.Problem {
 	for _, ns := range namespaces {
 		perNs = append(perNs, k8s.DetectProblems(p.cache, ns))
 	}
+	return flattenNamespacedProblems(perNs)
+}
+
+// DetectMissingRefs returns dangling-reference problems for all enabled
+// source kinds in DetectMissingRefs + DetectMissingWebhookRefs. Same
+// flattenNamespacedProblems shape as DetectProblems: cluster-scoped
+// rows (ClusterRoleBinding etc.) only come back when namespaces==nil.
+func (p *CacheProvider) DetectMissingRefs(namespaces []string) []k8s.Problem {
+	if len(namespaces) == 0 {
+		out := k8s.DetectMissingRefs(p.cache, "")
+		out = append(out, k8s.DetectMissingWebhookRefs(p.cache, p.dynamic, p.discovery, "")...)
+		return out
+	}
+	perNs := make([][]k8s.Problem, 0, len(namespaces))
+	for _, ns := range namespaces {
+		perNs = append(perNs, k8s.DetectMissingRefs(p.cache, ns))
+	}
+	// Webhook configs are cluster-scoped — namespace-bounded callers do
+	// not see them, same convention DetectProblems uses for Node rows.
 	return flattenNamespacedProblems(perNs)
 }
 
@@ -83,14 +100,6 @@ func flattenNamespacedProblems(perNs [][]k8s.Problem) []k8s.Problem {
 		}
 	}
 	return out
-}
-
-func (p *CacheProvider) AuditFindings(namespaces []string) []bp.Finding {
-	results := audit.RunFromCache(p.cache, namespaces, nil)
-	if results == nil {
-		return nil
-	}
-	return results.Findings
 }
 
 func (p *CacheProvider) WarningEvents(namespaces []string, since time.Duration) []*corev1.Event {

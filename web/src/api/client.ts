@@ -140,6 +140,9 @@ export interface WorkloadCount {
 export interface DashboardMetrics {
   cpu?: MetricSummary
   memory?: MetricSummary
+  // When false, only requests/capacity are meaningful — live usage (from
+  // metrics-server) is unavailable and usage fields are zero.
+  usageAvailable: boolean
 }
 
 export interface MetricSummary {
@@ -3026,6 +3029,9 @@ export interface DiagInformerSyncStatus {
   synced: boolean
   syncedAt?: string
   items: number
+  lastError?: string
+  lastErrorAt?: string
+  forbiddenSeen?: boolean
 }
 
 export interface DiagCacheSyncStatus {

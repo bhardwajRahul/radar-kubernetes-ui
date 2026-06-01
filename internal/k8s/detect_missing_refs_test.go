@@ -567,6 +567,88 @@ func TestDetectMissingWebhookRefs(t *testing.T) {
 	}
 }
 
+func TestDetectMissingGatewayRefs(t *testing.T) {
+	defer ResetTestState()
+	defer ResetTestDynamicState()
+
+	now := metav1.NewTime(time.Now().Add(-5 * time.Minute))
+	existingSvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "prod", CreationTimestamp: now},
+		Spec:       corev1.ServiceSpec{Ports: []corev1.ServicePort{{Name: "http", Port: 80}}},
+	}
+	crossNsSvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "platform", CreationTimestamp: now},
+		Spec:       corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 8080}}},
+	}
+	grantedCrossNsSvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared-granted", Namespace: "platform", CreationTimestamp: now},
+		Spec:       corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 8080}}},
+	}
+	client := fake.NewClientset(existingSvc, crossNsSvc, grantedCrossNsSvc)
+	if err := InitTestResourceCache(client); err != nil {
+		t.Fatalf("InitTestResourceCache: %v", err)
+	}
+
+	routeGVR := schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1", Resource: "httproutes"}
+	refGrantGVR := schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1beta1", Resource: "referencegrants"}
+	scheme := runtime.NewScheme()
+	dynClient := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		scheme,
+		map[schema.GroupVersionResource]string{
+			routeGVR:    "HTTPRouteList",
+			refGrantGVR: "ReferenceGrantList",
+		},
+		gatewayRoute("broken", "prod", now, []any{
+			map[string]any{"name": "missing", "port": int64(80)},
+			map[string]any{"name": "api", "port": int64(9090)},
+			map[string]any{"name": "api", "port": int64(80)},
+			map[string]any{"name": "api"},
+			map[string]any{"name": "shared", "namespace": "platform", "port": int64(8080)},
+			map[string]any{"name": "shared-granted", "namespace": "platform", "port": int64(8080)},
+			map[string]any{"group": "storage.k8s.io", "kind": "StorageClass", "name": "not-service"},
+		}),
+		gatewayReferenceGrant("allow-shared-granted", "platform", now, "", "HTTPRoute", "prod", "shared-granted"),
+	)
+	if err := InitTestDynamicResourceCache(dynClient, []APIResource{
+		{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute", Name: "httproutes", Verbs: []string{"list", "watch"}},
+		{Group: "gateway.networking.k8s.io", Version: "v1beta1", Kind: "ReferenceGrant", Name: "referencegrants", Verbs: []string{"list", "watch"}},
+	}); err != nil {
+		t.Fatalf("InitTestDynamicResourceCache: %v", err)
+	}
+	dynCache := GetDynamicResourceCache()
+	if err := dynCache.EnsureWatching(routeGVR); err != nil {
+		t.Fatalf("EnsureWatching httproutes: %v", err)
+	}
+	if !dynCache.WaitForSync(routeGVR, 2*time.Second) {
+		t.Fatal("httproute dynamic cache did not sync")
+	}
+	if err := dynCache.EnsureWatching(refGrantGVR); err != nil {
+		t.Fatalf("EnsureWatching referencegrants: %v", err)
+	}
+	if !dynCache.WaitForSync(refGrantGVR, 2*time.Second) {
+		t.Fatal("referencegrant dynamic cache did not sync")
+	}
+
+	problems := DetectMissingGatewayRefs(GetResourceCache(), dynCache, GetResourceDiscovery(), "")
+	if !findProblem(problems, "HTTPRoute", "prod", "broken", "Missing Gateway backend Service") {
+		t.Fatalf("missing Gateway backend Service not detected: %+v", problems)
+	}
+	if !findProblem(problems, "HTTPRoute", "prod", "broken", "Missing Gateway backend Service port") {
+		t.Fatalf("missing Gateway backend Service port not detected: %+v", problems)
+	}
+	if !findProblem(problems, "HTTPRoute", "prod", "broken", "Missing Gateway ReferenceGrant") {
+		t.Fatalf("missing Gateway ReferenceGrant not detected: %+v", problems)
+	}
+	if len(problems) != 4 {
+		t.Fatalf("expected exactly 4 Gateway missing-ref problems, got %+v", problems)
+	}
+
+	scoped := DetectMissingGatewayRefs(GetResourceCache(), dynCache, GetResourceDiscovery(), "prod")
+	if len(scoped) != 4 {
+		t.Fatalf("namespace-scoped Gateway refs should include prod route problems, got %+v", scoped)
+	}
+}
+
 func webhookConfig(kind, name string, ts metav1.Time, webhooks []any) *unstructured.Unstructured {
 	return &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "admissionregistration.k8s.io/v1",
@@ -576,6 +658,47 @@ func webhookConfig(kind, name string, ts metav1.Time, webhooks []any) *unstructu
 			"creationTimestamp": ts.Format(time.RFC3339),
 		},
 		"webhooks": webhooks,
+	}}
+}
+
+func gatewayRoute(name, namespace string, ts metav1.Time, backendRefs []any) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "gateway.networking.k8s.io/v1",
+		"kind":       "HTTPRoute",
+		"metadata": map[string]any{
+			"name":              name,
+			"namespace":         namespace,
+			"creationTimestamp": ts.Format(time.RFC3339),
+		},
+		"spec": map[string]any{
+			"rules": []any{
+				map[string]any{"backendRefs": backendRefs},
+			},
+		},
+	}}
+}
+
+func gatewayReferenceGrant(name, namespace string, ts metav1.Time, fromGroup, fromKind, fromNamespace, toService string) *unstructured.Unstructured {
+	from := map[string]any{"kind": fromKind, "namespace": fromNamespace}
+	if fromGroup != "" {
+		from["group"] = fromGroup
+	}
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "gateway.networking.k8s.io/v1beta1",
+		"kind":       "ReferenceGrant",
+		"metadata": map[string]any{
+			"name":              name,
+			"namespace":         namespace,
+			"creationTimestamp": ts.Format(time.RFC3339),
+		},
+		"spec": map[string]any{
+			"from": []any{
+				from,
+			},
+			"to": []any{
+				map[string]any{"group": "", "kind": "Service", "name": toService},
+			},
+		},
 	}}
 }
 

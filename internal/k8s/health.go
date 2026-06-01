@@ -21,6 +21,12 @@ const crashLoopReason = "CrashLoopBackOff"
 // `unknown` catch-all (see PodProblemReason / category.Classify).
 const highRestartReason = "HighRestartCount"
 
+const readinessProbeFailedReason = "ReadinessProbeFailed"
+
+const readinessProbeInvalidReason = "ReadinessProbeInvalid"
+const livenessProbeInvalidReason = "LivenessProbeInvalid"
+const initContainerStalledReason = "InitContainerStalled"
+
 // highRestartThreshold is the cumulative per-container RestartCount above which
 // a still-unhealthy container is treated as actively thrashing.
 const highRestartThreshold = 3
@@ -151,6 +157,88 @@ func podActiveThrashContainer(pod *corev1.Pod, now time.Time) bool {
 	return false
 }
 
+func containerHasTrustedReady(containers []corev1.Container, cs corev1.ContainerStatus) bool {
+	return cs.Ready && containerHasReadinessProbe(containers, cs.Name)
+}
+
+func containerRecentlyRecoveredFromOOM(containers []corev1.Container, cs corev1.ContainerStatus, now time.Time) bool {
+	if cs.LastTerminationState.Terminated == nil || cs.LastTerminationState.Terminated.Reason != "OOMKilled" {
+		return false
+	}
+	if containerHasTrustedReady(containers, cs) {
+		return false
+	}
+	if r := cs.State.Running; r != nil && !r.StartedAt.IsZero() {
+		return now.Sub(r.StartedAt.Time) <= 5*time.Minute
+	}
+	return cs.State.Waiting != nil || restartedRecently(&cs, now, 5*time.Minute)
+}
+
+func podHasActiveOOMKilled(pod *corev1.Pod, now time.Time) bool {
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.State.Terminated != nil && cs.State.Terminated.Reason == "OOMKilled" {
+			return true
+		}
+		if containerRecentlyRecoveredFromOOM(pod.Spec.Containers, cs, now) {
+			return true
+		}
+	}
+	for _, cs := range pod.Status.InitContainerStatuses {
+		if cs.State.Terminated != nil && cs.State.Terminated.Reason == "OOMKilled" {
+			return true
+		}
+		if cs.LastTerminationState.Terminated != nil && cs.LastTerminationState.Terminated.Reason == "OOMKilled" {
+			if cs.State.Terminated != nil && cs.State.Terminated.ExitCode == 0 {
+				continue
+			}
+			if r := cs.State.Running; r != nil && !r.StartedAt.IsZero() && now.Sub(r.StartedAt.Time) > 5*time.Minute {
+				continue
+			}
+			return true
+		}
+	}
+	return false
+}
+
+func podHasReadinessProbeFailure(pod *corev1.Pod, now time.Time) bool {
+	if pod.Status.Phase != corev1.PodRunning {
+		return false
+	}
+	if !podReadyFalseLongEnough(pod, now, 5*time.Minute) {
+		return false
+	}
+	for i := range pod.Status.ContainerStatuses {
+		cs := &pod.Status.ContainerStatuses[i]
+		if cs.Ready || cs.State.Running == nil {
+			continue
+		}
+		if containerHasReadinessProbe(pod.Spec.Containers, cs.Name) {
+			return true
+		}
+	}
+	return false
+}
+
+func podReadyFalseLongEnough(pod *corev1.Pod, now time.Time, minAge time.Duration) bool {
+	for i := range pod.Status.Conditions {
+		cond := &pod.Status.Conditions[i]
+		if cond.Type != corev1.PodReady && cond.Type != corev1.ContainersReady {
+			continue
+		}
+		if cond.Status != corev1.ConditionFalse {
+			continue
+		}
+		if !cond.LastTransitionTime.IsZero() {
+			return now.Sub(cond.LastTransitionTime.Time) >= minAge
+		}
+		if !pod.CreationTimestamp.IsZero() {
+			return now.Sub(pod.CreationTimestamp.Time) >= minAge
+		}
+		return true
+	}
+	return false
+}
+
 // ClassifyPodHealth determines if a pod is "healthy", "warning", or "error".
 // This is the canonical implementation used by both MCP and REST dashboards.
 func ClassifyPodHealth(pod *corev1.Pod, now time.Time) string {
@@ -176,12 +264,9 @@ func ClassifyPodHealth(pod *corev1.Pod, now time.Time) string {
 		if cs.State.Waiting != nil && isFatalWaitingReason(cs.State.Waiting.Reason) {
 			return "error"
 		}
-		if cs.State.Terminated != nil && cs.State.Terminated.Reason == "OOMKilled" {
-			return "error"
-		}
-		if cs.LastTerminationState.Terminated != nil && cs.LastTerminationState.Terminated.Reason == "OOMKilled" {
-			return "error"
-		}
+	}
+	if podHasActiveOOMKilled(pod, now) {
+		return "error"
 	}
 
 	// Init container errors
@@ -197,6 +282,10 @@ func ClassifyPodHealth(pod *corev1.Pod, now time.Time) string {
 			return "warning"
 		}
 		return "healthy"
+	}
+
+	if podHasReadinessProbeFailure(pod, now) {
+		return "warning"
 	}
 
 	// Warning: a container actively thrashing — high cumulative restarts AND
@@ -261,6 +350,9 @@ func PodProblemReason(pod *corev1.Pod) string {
 	now := time.Now()
 	if podHasStableCrashLoop(pod, now) && isPhaseOrCrashReason(reason) {
 		return crashLoopReason
+	}
+	if podHasActiveOOMKilled(pod, now) && isPhaseOnlyReason(reason) {
+		return "OOMKilled"
 	}
 	// Actively-thrashing-but-not-a-classic-backoff: a container churning on
 	// failed readiness probes with clean (exit 0) terminations isn't a stable
@@ -336,6 +428,9 @@ func podProblemReasonRaw(pod *corev1.Pod) string {
 		if cs.State.Terminated != nil && cs.State.Terminated.Reason != "" {
 			return cs.State.Terminated.Reason
 		}
+	}
+	if podHasReadinessProbeFailure(pod, time.Now()) {
+		return readinessProbeFailedReason
 	}
 	return string(pod.Status.Phase)
 }

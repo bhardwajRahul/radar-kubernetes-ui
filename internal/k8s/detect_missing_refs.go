@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/skyhook-io/radar/internal/logsafe"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
@@ -14,6 +15,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
+	corev1listers "k8s.io/client-go/listers/core/v1"
 )
 
 // DetectMissingRefs scans cache for resources whose by-name references point at
@@ -641,6 +643,227 @@ func DetectMissingWebhookRefs(cache *ResourceCache, dynamicCache *DynamicResourc
 		"MutatingWebhookConfiguration", "admissionregistration.k8s.io", "webhooks",
 	)...)
 	return out
+}
+
+// DetectMissingGatewayRefs scans Gateway API Routes for backend Service refs
+// that point at missing Services or missing Service ports. Controller status
+// usually reports these via ResolvedRefs=False, but this structural check still
+// works before a controller reconciles and on clusters where route status is
+// sparse.
+func DetectMissingGatewayRefs(cache *ResourceCache, dynamicCache *DynamicResourceCache, discovery *ResourceDiscovery, namespace string) []Detection {
+	if cache == nil || dynamicCache == nil || discovery == nil {
+		return nil
+	}
+	svcLister := cache.Services()
+	if svcLister == nil {
+		return nil
+	}
+	now := time.Now()
+	getReferenceGrants := gatewayReferenceGrantGetter(dynamicCache, discovery)
+	var out []Detection
+	for _, kind := range []string{"HTTPRoute", "GRPCRoute", "TCPRoute", "TLSRoute"} {
+		gvr, ok := discovery.GetGVRWithGroup(kind, "gateway.networking.k8s.io")
+		if !ok {
+			continue
+		}
+		var routes []*unstructured.Unstructured
+		if namespace != "" {
+			items, err := dynamicCache.List(gvr, namespace)
+			if err != nil {
+				log.Printf("[missing-refs] failed to list %s.gateway.networking.k8s.io in %s: %s", logsafe.Sanitize(kind), logsafe.Sanitize(namespace), logsafe.Sanitize(err.Error()))
+				continue
+			}
+			routes = items
+		} else {
+			items, err := dynamicCache.ListWatched(gvr)
+			if err != nil {
+				log.Printf("[missing-refs] failed to list %s.gateway.networking.k8s.io: %s", logsafe.Sanitize(kind), logsafe.Sanitize(err.Error()))
+				continue
+			}
+			routes = items
+		}
+		for _, route := range routes {
+			out = append(out, detectGatewayRouteMissingBackends(svcLister, getReferenceGrants, kind, route, now)...)
+		}
+	}
+	return out
+}
+
+type referenceGrantGetter func(namespace string) ([]*unstructured.Unstructured, bool)
+
+func gatewayReferenceGrantGetter(dynamicCache *DynamicResourceCache, discovery *ResourceDiscovery) referenceGrantGetter {
+	refGrantGVR, ok := discovery.GetGVRWithGroup("ReferenceGrant", "gateway.networking.k8s.io")
+	if !ok {
+		return nil
+	}
+	grantsByNS := map[string][]*unstructured.Unstructured{}
+	knownByNS := map[string]bool{}
+	return func(namespace string) ([]*unstructured.Unstructured, bool) {
+		if knownByNS[namespace] {
+			return grantsByNS[namespace], true
+		}
+		items, err := dynamicCache.List(refGrantGVR, namespace)
+		if err != nil {
+			log.Printf("[missing-refs] failed to list ReferenceGrant.gateway.networking.k8s.io in %s: %s", logsafe.Sanitize(namespace), logsafe.Sanitize(err.Error()))
+			return nil, false
+		}
+		grantsByNS[namespace] = items
+		knownByNS[namespace] = true
+		return items, true
+	}
+}
+
+func detectGatewayRouteMissingBackends(svcLister corev1listers.ServiceLister, getReferenceGrants referenceGrantGetter, kind string, route *unstructured.Unstructured, now time.Time) []Detection {
+	rules, found, err := unstructured.NestedSlice(route.Object, "spec", "rules")
+	if err != nil || !found {
+		return nil
+	}
+	age := now.Sub(route.GetCreationTimestamp().Time)
+	seen := map[string]bool{}
+	var out []Detection
+	for ri, r := range rules {
+		rm, ok := r.(map[string]any)
+		if !ok {
+			continue
+		}
+		refs, _ := rm["backendRefs"].([]any)
+		for bi, ref := range refs {
+			refm, ok := ref.(map[string]any)
+			if !ok {
+				continue
+			}
+			name, _ := refm["name"].(string)
+			if name == "" || !gatewayBackendRefIsService(refm) {
+				continue
+			}
+			svcNS := route.GetNamespace()
+			if ns, _ := refm["namespace"].(string); ns != "" {
+				svcNS = ns
+			}
+			port := gatewayBackendPort(refm)
+			key := svcNS + "/" + name + "/" + port
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			svc, err := svcLister.Services(svcNS).Get(name)
+			source := fmt.Sprintf("spec.rules[%d].backendRefs[%d]", ri, bi)
+			if err != nil {
+				out = append(out, missingRefProblem(kind, "gateway.networking.k8s.io", route.GetNamespace(), route.GetName(),
+					"Missing Gateway backend Service",
+					fmt.Sprintf("%s references Service %q in namespace %q which does not exist (route backend cannot receive traffic)", source, name, svcNS),
+					age))
+				continue
+			}
+			if port == "" {
+				out = append(out, missingRefProblem(kind, "gateway.networking.k8s.io", route.GetNamespace(), route.GetName(),
+					"Missing Gateway backend Service port",
+					fmt.Sprintf("%s references Service %q in namespace %q but does not specify the required Service port (route backend cannot receive traffic)", source, name, svcNS),
+					age))
+				continue
+			}
+			if !serviceHasPort(svc, port) {
+				out = append(out, missingRefProblem(kind, "gateway.networking.k8s.io", route.GetNamespace(), route.GetName(),
+					"Missing Gateway backend Service port",
+					fmt.Sprintf("%s targets Service %q in namespace %q port %q which does not exist on the Service (route backend cannot receive traffic)", source, name, svcNS, port),
+					age))
+			}
+			if svcNS != route.GetNamespace() && getReferenceGrants != nil {
+				if grants, ok := getReferenceGrants(svcNS); ok && !gatewayReferenceGranted(grants, kind, route.GetNamespace(), name) {
+					out = append(out, missingRefProblem(kind, "gateway.networking.k8s.io", route.GetNamespace(), route.GetName(),
+						"Missing Gateway ReferenceGrant",
+						fmt.Sprintf("%s references Service %q in namespace %q, but that namespace has no ReferenceGrant allowing %s from namespace %q", source, name, svcNS, kind, route.GetNamespace()),
+						age))
+				}
+			}
+		}
+	}
+	return out
+}
+
+func gatewayBackendRefIsService(ref map[string]any) bool {
+	group, _ := ref["group"].(string)
+	kind, _ := ref["kind"].(string)
+	return group == "" && (kind == "" || kind == "Service")
+}
+
+func gatewayBackendPort(ref map[string]any) string {
+	switch v := ref["port"].(type) {
+	case int64:
+		return fmt.Sprintf("%d", v)
+	case int32:
+		return fmt.Sprintf("%d", v)
+	case int:
+		return fmt.Sprintf("%d", v)
+	case float64:
+		if v == float64(int64(v)) {
+			return fmt.Sprintf("%d", int64(v))
+		}
+	case string:
+		return v
+	}
+	return ""
+}
+
+func serviceHasPort(svc *corev1.Service, port string) bool {
+	for _, sp := range svc.Spec.Ports {
+		if sp.Name == port || fmt.Sprintf("%d", sp.Port) == port {
+			return true
+		}
+	}
+	return false
+}
+
+func gatewayReferenceGranted(grants []*unstructured.Unstructured, routeKind, routeNS, svcName string) bool {
+	for _, grant := range grants {
+		froms, foundFrom, _ := unstructured.NestedSlice(grant.Object, "spec", "from")
+		tos, foundTo, _ := unstructured.NestedSlice(grant.Object, "spec", "to")
+		if !foundFrom || !foundTo {
+			continue
+		}
+		if !referenceGrantAllowsFrom(froms, routeKind, routeNS) {
+			continue
+		}
+		if referenceGrantAllowsToService(tos, svcName) {
+			return true
+		}
+	}
+	return false
+}
+
+func referenceGrantAllowsFrom(froms []any, routeKind, routeNS string) bool {
+	for _, from := range froms {
+		fm, ok := from.(map[string]any)
+		if !ok {
+			continue
+		}
+		group, _ := fm["group"].(string)
+		kind, _ := fm["kind"].(string)
+		namespace, _ := fm["namespace"].(string)
+		if group == "" {
+			group = "gateway.networking.k8s.io"
+		}
+		if group == "gateway.networking.k8s.io" && kind == routeKind && namespace == routeNS {
+			return true
+		}
+	}
+	return false
+}
+
+func referenceGrantAllowsToService(tos []any, svcName string) bool {
+	for _, to := range tos {
+		tm, ok := to.(map[string]any)
+		if !ok {
+			continue
+		}
+		group, _ := tm["group"].(string)
+		kind, _ := tm["kind"].(string)
+		name, _ := tm["name"].(string)
+		if group == "" && kind == "Service" && (name == "" || name == svcName) {
+			return true
+		}
+	}
+	return false
 }
 
 func detectPVCMissingStorageClass(cache *ResourceCache, namespace string, now time.Time) []Detection {

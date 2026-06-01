@@ -1,6 +1,10 @@
 package issues
 
-import "github.com/skyhook-io/radar/pkg/issuesapi"
+import (
+	"strings"
+
+	"github.com/skyhook-io/radar/pkg/issuesapi"
+)
 
 // dedupePodSchedulingOverProblem drops the generic problem-source row for a
 // Pod when the scheduling source emitted one for the same Pod. A pod stuck
@@ -115,6 +119,49 @@ func dedupeWorkloadDegradedOverChild(in []Issue) []Issue {
 		out = append(out, i)
 	}
 	return out
+}
+
+// dedupeConditionOverMissingRef drops a CRD condition row when a structural
+// missing-reference detector already emitted the same category for the same
+// object. Controller status commonly echoes dangling refs (for example Gateway
+// Route ResolvedRefs=False), but the missing-ref row names the exact broken
+// Service/port and works before controller reconciliation, so it is the richer
+// row.
+func dedupeConditionOverMissingRef(in []Issue) []Issue {
+	structural := map[string]bool{}
+	for _, i := range in {
+		if i.Source != SourceMissingRef {
+			continue
+		}
+		structural[issueResourceCategoryKey(i)] = true
+	}
+	if len(structural) == 0 {
+		return in
+	}
+	out := in[:0]
+	for _, i := range in {
+		if i.Source == SourceCondition && structural[issueResourceCategoryKey(i)] && isMissingRefEchoCondition(i) {
+			continue
+		}
+		out = append(out, i)
+	}
+	return out
+}
+
+func isMissingRefEchoCondition(i Issue) bool {
+	if i.Group != "gateway.networking.k8s.io" {
+		return false
+	}
+	switch i.Kind {
+	case "HTTPRoute", "GRPCRoute", "TCPRoute", "TLSRoute":
+		return strings.HasPrefix(i.Reason, "ResolvedRefs:")
+	default:
+		return false
+	}
+}
+
+func issueResourceCategoryKey(i Issue) string {
+	return resourceKey(i.Group, i.Kind, i.Namespace, i.Name) + "\x00" + string(i.Category)
 }
 
 // subjectKeyOf is the canonical string key for a subject Ref — the same

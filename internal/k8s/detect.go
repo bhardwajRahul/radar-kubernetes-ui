@@ -17,6 +17,13 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
+const probeFailureWindow = 10 * time.Minute
+
+const livenessProbeFailedReason = "LivenessProbeFailed"
+
+const terminatingWarningAfter = 10 * time.Minute
+const terminatingCriticalAfter = 30 * time.Minute
+
 // Detection is a transport-neutral raw operational finding emitted by the
 // detector layer — a failing Deployment, a crashlooping pod, a dangling
 // reference, a degraded Argo app. It carries NO classification, grouping, or
@@ -99,20 +106,35 @@ func DetectProblems(cache *ResourceCache, namespace string) []Detection {
 			deps, _ = depLister.List(labels.Everything())
 		}
 		for _, d := range deps {
-			// A ProgressDeadlineExceeded rollout is the more specific, actionable
-			// signal AND it implies unavailable replicas — so when the rollout is
-			// stuck, emit only the rollout row, not a redundant "X/Y available"
-			// degraded row for the same Deployment (one incident, not two).
-			var stuck *appsv1.DeploymentCondition
-			for i := range d.Status.Conditions {
-				c := &d.Status.Conditions[i]
-				if c.Type == appsv1.DeploymentProgressing && c.Status == "False" && c.Reason == "ProgressDeadlineExceeded" {
-					stuck = c
-					break
+			if det, ok := terminatingProblem("Deployment", "apps", d, now); ok {
+				problems = append(problems, det)
+				continue
+			}
+			replicaFailure := deploymentReplicaFailure(d)
+			stuck := deploymentProgressDeadlineExceeded(d)
+			if replicaFailure != nil {
+				ageDur := now.Sub(d.CreationTimestamp.Time)
+				durDur := ageDur
+				if !replicaFailure.LastTransitionTime.IsZero() {
+					durDur = now.Sub(replicaFailure.LastTransitionTime.Time)
 				}
+				problems = append(problems, Detection{
+					Kind:            "Deployment",
+					Namespace:       d.Namespace,
+					Name:            d.Name,
+					Group:           "apps",
+					Severity:        "critical",
+					Reason:          "ReplicaFailure",
+					Message:         replicaFailure.Message,
+					Fingerprint:     "deployment:replica-failure",
+					Age:             FormatAge(ageDur),
+					AgeSeconds:      int64(ageDur.Seconds()),
+					Duration:        FormatAge(durDur),
+					DurationSeconds: int64(durDur.Seconds()),
+				})
 			}
 
-			if d.Status.UnavailableReplicas > 0 && stuck == nil {
+			if d.Status.UnavailableReplicas > 0 && stuck == nil && replicaFailure == nil {
 				ageDur := now.Sub(d.CreationTimestamp.Time)
 				durDur := ageDur // fallback to creation time
 				for _, cond := range d.Status.Conditions {
@@ -140,7 +162,7 @@ func DetectProblems(cache *ResourceCache, namespace string) []Detection {
 				})
 			}
 
-			if stuck != nil {
+			if stuck != nil && replicaFailure == nil {
 				durDur := now.Sub(d.CreationTimestamp.Time)
 				if !stuck.LastTransitionTime.IsZero() {
 					durDur = now.Sub(stuck.LastTransitionTime.Time)
@@ -179,6 +201,10 @@ func DetectProblems(cache *ResourceCache, namespace string) []Detection {
 			ssets, _ = ssLister.List(labels.Everything())
 		}
 		for _, ss := range ssets {
+			if det, ok := terminatingProblem("StatefulSet", "apps", ss, now); ok {
+				problems = append(problems, det)
+				continue
+			}
 			// status.replicas counts pods the controller has created so far; a
 			// partitioned/ordered rollout wedged on an early ordinal (bad image)
 			// can have ReadyReplicas == Replicas while spec.replicas is never
@@ -214,33 +240,52 @@ func DetectProblems(cache *ResourceCache, namespace string) []Detection {
 			dsets, _ = dsLister.List(labels.Everything())
 		}
 		for _, ds := range dsets {
-			if ds.Status.NumberUnavailable > 0 {
-				ageDur := now.Sub(ds.CreationTimestamp.Time)
+			if det, ok := terminatingProblem("DaemonSet", "apps", ds, now); ok {
+				problems = append(problems, det)
+				continue
+			}
+			ageDur := now.Sub(ds.CreationTimestamp.Time)
+			appendDSProblem := func(reason, severity, fingerprint string) {
 				problems = append(problems, Detection{
 					Kind:            "DaemonSet",
 					Namespace:       ds.Namespace,
 					Name:            ds.Name,
 					Group:           "apps",
-					Severity:        "critical",
-					Reason:          fmt.Sprintf("%d unavailable", ds.Status.NumberUnavailable),
+					Severity:        severity,
+					Reason:          reason,
+					Fingerprint:     fingerprint,
 					Age:             FormatAge(ageDur),
 					AgeSeconds:      int64(ageDur.Seconds()),
 					Duration:        FormatAge(ageDur),
 					DurationSeconds: int64(ageDur.Seconds()),
 				})
 			}
+			if ds.Status.NumberMisscheduled > 0 {
+				appendDSProblem(fmt.Sprintf("%d misscheduled", ds.Status.NumberMisscheduled), "high", "daemonset:misscheduled")
+			}
+			if ds.Status.DesiredNumberScheduled > ds.Status.CurrentNumberScheduled {
+				appendDSProblem(fmt.Sprintf("%d not scheduled", ds.Status.DesiredNumberScheduled-ds.Status.CurrentNumberScheduled), "critical", "daemonset:not-scheduled")
+			} else if ds.Status.NumberUnavailable > 0 {
+				appendDSProblem(fmt.Sprintf("%d unavailable", ds.Status.NumberUnavailable), "critical", "daemonset:unavailable")
+			}
 		}
 	}
 
 	podsByNamespace := listPodsByNamespace(cache, namespace)
+	probeFailures := latestProbeFailures(cache, namespace, now)
 
 	// Pod problems: high-signal container waiting/terminated states, old
 	// Pending pods, and restart-heavy pods. These are useful direct pointers
 	// even when a controller-level problem also exists.
 	for _, pods := range podsByNamespace {
 		for _, pod := range pods {
+			if det, ok := terminatingProblem("Pod", "", pod, now); ok {
+				problems = append(problems, det)
+				continue
+			}
 			health := ClassifyPodHealth(pod, now)
-			if health == "healthy" {
+			earlyProbeTargetProblem, hasEarlyProbeTargetProblem := activeProbeTargetProblem(pod, "")
+			if health == "healthy" && !hasEarlyProbeTargetProblem {
 				continue
 			}
 			// Unschedulable pods are owned by the scheduling source, which
@@ -255,13 +300,34 @@ func DetectProblems(cache *ResourceCache, namespace string) []Detection {
 			}
 			restartCount, lastTermReason := PodRestartContext(pod)
 			ownerGroup, ownerKind, ownerName := podOwnerKindName(cache, pod)
+			reason := PodProblemReason(pod)
+			message := PodProblemMessage(pod)
+			if pf, ok := probeFailures[pod.Namespace+"/"+pod.Name]; ok && shouldUseProbeFailure(pod, reason, lastTermReason, pf.reason, now) {
+				reason = pf.reason
+				message = pf.message
+			}
+			fingerprint := ""
+			if inv, ok := activeProbeTargetProblem(pod, reason); ok {
+				reason = inv.reason
+				message = inv.message
+				fingerprint = inv.fingerprint
+			} else if hasEarlyProbeTargetProblem {
+				reason = earlyProbeTargetProblem.reason
+				message = earlyProbeTargetProblem.message
+				fingerprint = earlyProbeTargetProblem.fingerprint
+			} else if init, ok := stalledInitContainerProblem(pod, now); ok {
+				reason = init.reason
+				message = init.message
+				fingerprint = init.fingerprint
+			}
 			problems = append(problems, Detection{
 				Kind:                 "Pod",
 				Namespace:            pod.Namespace,
 				Name:                 pod.Name,
 				Severity:             severity,
-				Reason:               PodProblemReason(pod),
-				Message:              PodProblemMessage(pod),
+				Reason:               reason,
+				Message:              message,
+				Fingerprint:          fingerprint,
 				Age:                  FormatAge(ageDur),
 				AgeSeconds:           int64(ageDur.Seconds()),
 				Duration:             FormatAge(ageDur),
@@ -288,11 +354,30 @@ func DetectProblems(cache *ResourceCache, namespace string) []Detection {
 			services, _ = svcLister.List(labels.Everything())
 		}
 		for _, svc := range services {
+			if det, ok := terminatingProblem("Service", "", svc, now); ok {
+				problems = append(problems, det)
+				continue
+			}
+			ageDur := now.Sub(svc.CreationTimestamp.Time)
+			if svc.Spec.Type == corev1.ServiceTypeLoadBalancer && len(svc.Status.LoadBalancer.Ingress) == 0 && ageDur > 5*time.Minute {
+				problems = append(problems, Detection{
+					Kind:            "Service",
+					Namespace:       svc.Namespace,
+					Name:            svc.Name,
+					Severity:        "high",
+					Reason:          "LoadBalancer pending",
+					Message:         "Service is type LoadBalancer but has no assigned external address",
+					Fingerprint:     "svc:loadbalancer-pending",
+					Age:             FormatAge(ageDur),
+					AgeSeconds:      int64(ageDur.Seconds()),
+					Duration:        FormatAge(ageDur),
+					DurationSeconds: int64(ageDur.Seconds()),
+				})
+			}
 			if svc.Spec.Type == corev1.ServiceTypeExternalName || len(svc.Spec.Selector) == 0 {
 				continue
 			}
 			selected := podsMatchingService(svc, podsByNamespace[svc.Namespace])
-			ageDur := now.Sub(svc.CreationTimestamp.Time)
 			if len(selected) == 0 {
 				// Warning, not critical: a Service with zero matching pods
 				// is often intentional (scaled-to-zero workload, dormant
@@ -457,6 +542,10 @@ func DetectProblems(cache *ResourceCache, namespace string) []Detection {
 			pdbs, _ = pdbLister.List(labels.Everything())
 		}
 		for _, pdb := range pdbs {
+			if det, ok := terminatingProblem("PodDisruptionBudget", "policy", pdb, now); ok {
+				problems = append(problems, det)
+				continue
+			}
 			if !pdbStructurallyBlocksEvictions(pdb) {
 				continue
 			}
@@ -517,6 +606,10 @@ func DetectProblems(cache *ResourceCache, namespace string) []Detection {
 			pvcs, _ = pvcLister.List(labels.Everything())
 		}
 		for _, pvc := range pvcs {
+			if det, ok := terminatingProblem("PersistentVolumeClaim", "", pvc, now); ok {
+				problems = append(problems, det)
+				continue
+			}
 			ageDur := now.Sub(pvc.CreationTimestamp.Time)
 			if pvc.Status.Phase == corev1.ClaimLost {
 				problems = append(problems, Detection{
@@ -532,6 +625,21 @@ func DetectProblems(cache *ResourceCache, namespace string) []Detection {
 					DurationSeconds: int64(ageDur.Seconds()),
 				})
 				continue
+			}
+			if resize := pvcResizeProblem(pvc); resize.reason != "" {
+				problems = append(problems, Detection{
+					Kind:            "PersistentVolumeClaim",
+					Namespace:       pvc.Namespace,
+					Name:            pvc.Name,
+					Severity:        resize.severity,
+					Reason:          resize.reason,
+					Message:         resize.message,
+					Fingerprint:     "pvc:resize:" + resize.reason,
+					Age:             FormatAge(ageDur),
+					AgeSeconds:      int64(ageDur.Seconds()),
+					Duration:        FormatAge(resize.duration(now, ageDur)),
+					DurationSeconds: int64(resize.duration(now, ageDur).Seconds()),
+				})
 			}
 			if pvc.Status.Phase == corev1.ClaimPending {
 				// A WaitForFirstConsumer PVC is Pending BY DESIGN until a pod that
@@ -561,6 +669,31 @@ func DetectProblems(cache *ResourceCache, namespace string) []Detection {
 		}
 	}
 
+	if pvLister := cache.PersistentVolumes(); pvLister != nil && namespace == "" {
+		pvs, _ := pvLister.List(labels.Everything())
+		for _, pv := range pvs {
+			if det, ok := terminatingProblem("PersistentVolume", "", pv, now); ok {
+				problems = append(problems, det)
+				continue
+			}
+			if pv.Status.Phase != corev1.VolumeFailed {
+				continue
+			}
+			ageDur := now.Sub(pv.CreationTimestamp.Time)
+			problems = append(problems, Detection{
+				Kind:            "PersistentVolume",
+				Name:            pv.Name,
+				Severity:        "critical",
+				Reason:          "Failed",
+				Message:         pv.Status.Message,
+				Age:             FormatAge(ageDur),
+				AgeSeconds:      int64(ageDur.Seconds()),
+				Duration:        FormatAge(ageDur),
+				DurationSeconds: int64(ageDur.Seconds()),
+			})
+		}
+	}
+
 	// Job problems: stuck active (running > 1h with no completions)
 	if jobLister := cache.Jobs(); jobLister != nil {
 		var jobs []*batchv1.Job
@@ -570,6 +703,10 @@ func DetectProblems(cache *ResourceCache, namespace string) []Detection {
 			jobs, _ = jobLister.List(labels.Everything())
 		}
 		for _, job := range jobs {
+			if det, ok := terminatingProblem("Job", "batch", job, now); ok {
+				problems = append(problems, det)
+				continue
+			}
 			ageDur := now.Sub(job.CreationTimestamp.Time)
 			if cond := failedJobCondition(job); cond != nil {
 				durDur := ageDur
@@ -655,6 +792,218 @@ func DetectProblems(cache *ResourceCache, namespace string) []Detection {
 	}
 
 	return problems
+}
+
+type probeFailure struct {
+	reason  string
+	message string
+	at      time.Time
+}
+
+type podSpecificProblem struct {
+	reason      string
+	message     string
+	fingerprint string
+}
+
+func activeProbeTargetProblem(pod *corev1.Pod, currentReason string) (podSpecificProblem, bool) {
+	for _, c := range pod.Spec.Containers {
+		if currentReason == readinessProbeFailedReason || podCurrentlyNotReady(pod) {
+			if port, ok := missingNamedProbePort(c, c.ReadinessProbe); ok {
+				return podSpecificProblem{
+					reason:      readinessProbeInvalidReason,
+					message:     fmt.Sprintf("readiness probe for container %q references named port %q, but the container declares no port with that name", c.Name, port),
+					fingerprint: "probe:readiness:" + c.Name + ":" + port,
+				}, true
+			}
+		}
+		if currentReason == livenessProbeFailedReason || currentReason == crashLoopReason || currentReason == highRestartReason {
+			if port, ok := missingNamedProbePort(c, c.LivenessProbe); ok {
+				return podSpecificProblem{
+					reason:      livenessProbeInvalidReason,
+					message:     fmt.Sprintf("liveness probe for container %q references named port %q, but the container declares no port with that name", c.Name, port),
+					fingerprint: "probe:liveness:" + c.Name + ":" + port,
+				}, true
+			}
+		}
+	}
+	return podSpecificProblem{}, false
+}
+
+func podCurrentlyNotReady(pod *corev1.Pod) bool {
+	if pod.Status.Phase != corev1.PodRunning {
+		return false
+	}
+	for _, cond := range pod.Status.Conditions {
+		if (cond.Type == corev1.PodReady || cond.Type == corev1.ContainersReady) && cond.Status == corev1.ConditionFalse {
+			return true
+		}
+	}
+	return false
+}
+
+func missingNamedProbePort(c corev1.Container, probe *corev1.Probe) (string, bool) {
+	if probe == nil {
+		return "", false
+	}
+	var port intstr.IntOrString
+	switch {
+	case probe.HTTPGet != nil:
+		port = probe.HTTPGet.Port
+	case probe.TCPSocket != nil:
+		port = probe.TCPSocket.Port
+	default:
+		return "", false
+	}
+	if port.Type != intstr.String || port.StrVal == "" {
+		return "", false
+	}
+	for _, declared := range c.Ports {
+		if declared.Name == port.StrVal {
+			return "", false
+		}
+	}
+	return port.StrVal, true
+}
+
+func stalledInitContainerProblem(pod *corev1.Pod, now time.Time) (podSpecificProblem, bool) {
+	if pod.Status.Phase != corev1.PodPending {
+		return podSpecificProblem{}, false
+	}
+	for _, cs := range pod.Status.InitContainerStatuses {
+		if cs.State.Running == nil || cs.State.Running.StartedAt.IsZero() {
+			continue
+		}
+		if now.Sub(cs.State.Running.StartedAt.Time) < 5*time.Minute {
+			continue
+		}
+		msg := fmt.Sprintf("init container %q has been running for %s and is blocking the pod from starting", cs.Name, FormatAge(now.Sub(cs.State.Running.StartedAt.Time)))
+		if detail := initContainerSpecSummary(pod, cs.Name); detail != "" {
+			msg += "; " + detail
+		}
+		return podSpecificProblem{
+			reason:      initContainerStalledReason,
+			message:     msg,
+			fingerprint: "init-stalled:" + cs.Name,
+		}, true
+	}
+	return podSpecificProblem{}, false
+}
+
+func initContainerSpecSummary(pod *corev1.Pod, name string) string {
+	for _, c := range pod.Spec.InitContainers {
+		if c.Name != name {
+			continue
+		}
+		parts := make([]string, 0, 2)
+		if c.Image != "" {
+			parts = append(parts, "image "+c.Image)
+		}
+		if len(c.Command) > 0 {
+			parts = append(parts, "command "+strings.Join(c.Command, " "))
+		} else if len(c.Args) > 0 {
+			parts = append(parts, "args "+strings.Join(c.Args, " "))
+		}
+		return strings.Join(parts, ", ")
+	}
+	return ""
+}
+
+func latestProbeFailures(cache *ResourceCache, namespace string, now time.Time) map[string]probeFailure {
+	out := map[string]probeFailure{}
+	if cache == nil || cache.Events() == nil {
+		return out
+	}
+	var events []*corev1.Event
+	if namespace != "" {
+		events, _ = cache.Events().Events(namespace).List(labels.Everything())
+	} else {
+		events, _ = cache.Events().List(labels.Everything())
+	}
+	for _, e := range events {
+		if e.InvolvedObject.Kind != "Pod" {
+			continue
+		}
+		reason, ok := classifyProbeFailureEvent(e.Reason, e.Message)
+		if !ok {
+			continue
+		}
+		t := eventLastTime(e)
+		if t.IsZero() || now.Sub(t) > probeFailureWindow {
+			continue
+		}
+		key := e.InvolvedObject.Namespace + "/" + e.InvolvedObject.Name
+		if cur, exists := out[key]; exists && !t.After(cur.at) {
+			continue
+		}
+		out[key] = probeFailure{reason: reason, message: strings.TrimSpace(e.Message), at: t}
+	}
+	return out
+}
+
+func classifyProbeFailureEvent(reason, msg string) (string, bool) {
+	if reason != "Unhealthy" {
+		return "", false
+	}
+	lower := strings.ToLower(msg)
+	switch {
+	case strings.Contains(lower, "liveness probe failed"):
+		return livenessProbeFailedReason, true
+	case strings.Contains(lower, "readiness probe failed"):
+		return readinessProbeFailedReason, true
+	default:
+		return "", false
+	}
+}
+
+func shouldUseProbeFailure(pod *corev1.Pod, currentReason, lastTerminatedReason, probeReason string, now time.Time) bool {
+	switch probeReason {
+	case readinessProbeFailedReason:
+		return currentReason == readinessProbeFailedReason || podHasReadinessProbeFailure(pod, now)
+	case livenessProbeFailedReason:
+		if lastTerminatedReason == "OOMKilled" {
+			return false
+		}
+		switch currentReason {
+		case "CrashLoopBackOff", "Error", "Failed", "Running", "Pending", "Unknown", "":
+			return true
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+func terminatingProblem(kind, group string, obj metav1.Object, now time.Time) (Detection, bool) {
+	if obj.GetDeletionTimestamp() == nil {
+		return Detection{}, false
+	}
+	duration := now.Sub(obj.GetDeletionTimestamp().Time)
+	if duration < terminatingWarningAfter {
+		return Detection{}, false
+	}
+	severity := "high"
+	if duration >= terminatingCriticalAfter {
+		severity = "critical"
+	}
+	msg := "Resource is still present after deletion started"
+	if finalizers := obj.GetFinalizers(); len(finalizers) > 0 {
+		msg = "Waiting on finalizers: " + strings.Join(finalizers, ", ")
+	}
+	return Detection{
+		Kind:            kind,
+		Group:           group,
+		Namespace:       obj.GetNamespace(),
+		Name:            obj.GetName(),
+		Severity:        severity,
+		Reason:          "Terminating stuck",
+		Message:         msg,
+		Fingerprint:     "lifecycle:terminating",
+		Age:             FormatAge(now.Sub(obj.GetCreationTimestamp().Time)),
+		AgeSeconds:      int64(now.Sub(obj.GetCreationTimestamp().Time).Seconds()),
+		Duration:        FormatAge(duration),
+		DurationSeconds: int64(duration.Seconds()),
+	}, true
 }
 
 func pdbStructurallyBlocksEvictions(pdb *policyv1.PodDisruptionBudget) bool {
@@ -753,6 +1102,45 @@ func pvcSingleNodeAccessOnly(pvc *corev1.PersistentVolumeClaim) bool {
 		}
 	}
 	return restrictive
+}
+
+type pvcResizeDetection struct {
+	reason             string
+	message            string
+	severity           string
+	lastTransitionTime metav1.Time
+}
+
+func (d pvcResizeDetection) duration(now time.Time, fallback time.Duration) time.Duration {
+	if !d.lastTransitionTime.IsZero() {
+		return now.Sub(d.lastTransitionTime.Time)
+	}
+	return fallback
+}
+
+func pvcResizeProblem(pvc *corev1.PersistentVolumeClaim) pvcResizeDetection {
+	for _, cond := range pvc.Status.Conditions {
+		if cond.Status != corev1.ConditionTrue {
+			continue
+		}
+		switch string(cond.Type) {
+		case "ControllerResizeError", "ModifyVolumeError":
+			return pvcResizeDetection{
+				reason:             string(cond.Type),
+				message:            cond.Message,
+				severity:           "critical",
+				lastTransitionTime: cond.LastTransitionTime,
+			}
+		case "NodeResizeError":
+			return pvcResizeDetection{
+				reason:             string(cond.Type),
+				message:            cond.Message,
+				severity:           "critical",
+				lastTransitionTime: cond.LastTransitionTime,
+			}
+		}
+	}
+	return pvcResizeDetection{}
 }
 
 // resourceAge returns now-creationTimestamp for the item in items matching
@@ -923,6 +1311,32 @@ func failedJobCondition(job *batchv1.Job) *batchv1.JobCondition {
 	for i := range job.Status.Conditions {
 		cond := &job.Status.Conditions[i]
 		if cond.Type == batchv1.JobFailed && cond.Status == corev1.ConditionTrue {
+			return cond
+		}
+	}
+	return nil
+}
+
+func deploymentReplicaFailure(dep *appsv1.Deployment) *appsv1.DeploymentCondition {
+	if dep == nil {
+		return nil
+	}
+	for i := range dep.Status.Conditions {
+		cond := &dep.Status.Conditions[i]
+		if cond.Type == appsv1.DeploymentReplicaFailure && cond.Status == corev1.ConditionTrue {
+			return cond
+		}
+	}
+	return nil
+}
+
+func deploymentProgressDeadlineExceeded(dep *appsv1.Deployment) *appsv1.DeploymentCondition {
+	if dep == nil {
+		return nil
+	}
+	for i := range dep.Status.Conditions {
+		cond := &dep.Status.Conditions[i]
+		if cond.Type == appsv1.DeploymentProgressing && cond.Status == corev1.ConditionFalse && cond.Reason == "ProgressDeadlineExceeded" {
 			return cond
 		}
 	}

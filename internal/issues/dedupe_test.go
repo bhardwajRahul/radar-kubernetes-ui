@@ -1,6 +1,10 @@
 package issues
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/skyhook-io/radar/pkg/issuesapi"
+)
 
 func TestDedupePodSchedulingOverProblem(t *testing.T) {
 	sched := Issue{Source: SourceScheduling, Kind: "Pod", Namespace: "ns", Name: "web-abc"}
@@ -36,4 +40,47 @@ func TestDedupePodSchedulingOverProblem(t *testing.T) {
 			t.Fatalf("expected both rows to survive when no scheduling row exists, got %+v", out)
 		}
 	})
+}
+
+func TestDedupeConditionOverMissingRef(t *testing.T) {
+	missing := Issue{
+		Source:    SourceMissingRef,
+		Group:     "gateway.networking.k8s.io",
+		Kind:      "HTTPRoute",
+		Namespace: "prod",
+		Name:      "broken",
+		Category:  issuesapi.CategoryGatewayRouteInvalid,
+	}
+	conditionEcho := Issue{
+		Source:    SourceCondition,
+		Group:     "gateway.networking.k8s.io",
+		Kind:      "HTTPRoute",
+		Namespace: "prod",
+		Name:      "broken",
+		Reason:    "ResolvedRefs: BackendNotFound",
+		Category:  issuesapi.CategoryGatewayRouteInvalid,
+	}
+	conditionAccepted := conditionEcho
+	conditionAccepted.Reason = "Accepted: NoMatchingParent"
+	conditionOtherCategory := conditionEcho
+	conditionOtherCategory.Category = issuesapi.CategoryGatewayNotReady
+	conditionOtherObject := conditionEcho
+	conditionOtherObject.Name = "other"
+
+	out := dedupeConditionOverMissingRef([]Issue{missing, conditionEcho, conditionAccepted, conditionOtherCategory, conditionOtherObject})
+	if len(out) != 4 {
+		t.Fatalf("expected only the ResolvedRefs echo to be dropped, got %+v", out)
+	}
+	var keptAccepted bool
+	for _, i := range out {
+		if i.Source == SourceCondition && i.Name == "broken" && i.Category == issuesapi.CategoryGatewayRouteInvalid && i.Reason == "ResolvedRefs: BackendNotFound" {
+			t.Fatalf("same-object ResolvedRefs echo survived: %+v", out)
+		}
+		if i.Source == SourceCondition && i.Name == "broken" && i.Reason == "Accepted: NoMatchingParent" {
+			keptAccepted = true
+		}
+	}
+	if !keptAccepted {
+		t.Fatalf("non-ResolvedRefs route condition was incorrectly dropped: %+v", out)
+	}
 }

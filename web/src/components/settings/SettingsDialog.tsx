@@ -245,14 +245,14 @@ export function SettingsDialog({ open, onClose, onShowMyPermissions }: SettingsD
         <div className="flex items-center justify-between gap-3 px-4 py-2.5 border-t border-theme-border shrink-0">
             <div className="flex items-center gap-2">
               <Tooltip content="Clear all fields — reverts to defaults when saved">
-                <button
-                  onClick={resetConfig}
-                  disabled={saving}
-                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-theme-text-secondary hover:text-theme-text-primary hover:bg-theme-elevated rounded-md transition-colors disabled:opacity-50"
-                >
-                  <RotateCcw className="w-3.5 h-3.5" />
-                  Reset
-                </button>
+              <button
+                onClick={resetConfig}
+                disabled={saving}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-theme-text-secondary hover:text-theme-text-primary hover:bg-theme-elevated rounded-md transition-colors disabled:opacity-50 disabled:pointer-events-none"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                Reset
+              </button>
               </Tooltip>
               {saveMessage && (
                 <span className={clsx(
@@ -490,12 +490,12 @@ function MCPSection({
                 {mcpUrl}
               </code>
               <Tooltip content="Copy MCP URL" wrapperClassName="shrink-0">
-                <button
-                  onClick={handleCopy}
-                  className="p-1.5 text-theme-text-tertiary hover:text-theme-text-primary hover:bg-theme-elevated rounded-md transition-colors"
-                >
-                  {copied ? <Check className="w-3.5 h-3.5 text-green-500" /> : <Copy className="w-3.5 h-3.5" />}
-                </button>
+              <button
+                onClick={handleCopy}
+                className="p-1.5 text-theme-text-tertiary hover:text-theme-text-primary hover:bg-theme-elevated rounded-md transition-colors"
+              >
+                {copied ? <Check className="w-3.5 h-3.5 text-green-500" /> : <Copy className="w-3.5 h-3.5" />}
+              </button>
               </Tooltip>
             </div>
           </div>

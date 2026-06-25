@@ -26,6 +26,7 @@ import (
 	"helm.sh/helm/v3/pkg/action"
 	"helm.sh/helm/v3/pkg/chart/loader"
 	"helm.sh/helm/v3/pkg/cli"
+	"helm.sh/helm/v3/pkg/registry"
 	"helm.sh/helm/v3/pkg/release"
 	"helm.sh/helm/v3/pkg/releaseutil"
 	"helm.sh/helm/v3/pkg/repo"
@@ -1170,59 +1171,79 @@ func (c *Client) checkForUpgrade(namespace, name, username string, groups []stri
 		CurrentVersion: currentVersion,
 	}
 
-	// Load repository file
+	// Load repository file. A missing/empty/unreadable repo config is not fatal —
+	// the user may rely solely on registered OCI sources, so we fall through to the
+	// OCI fallback with an empty classic-candidate set rather than returning early.
+	var candidates []repoVersionInfo
+	noClassicRepos := false
+	indexLoadFailed := false
 	repoFile := c.settings.RepositoryConfig
 	f, err := repo.LoadFile(repoFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			info.Error = "no helm repositories configured"
-			return info, nil
+	switch {
+	case err != nil:
+		if !os.IsNotExist(err) {
+			log.Printf("[helm] failed to load repository config %s (treating as no classic repos): %v", repoFile, err)
 		}
-		info.Error = fmt.Sprintf("failed to load repo file: %v", err)
-		return info, nil
-	}
-
-	if len(f.Repositories) == 0 {
-		info.Error = "no helm repositories configured"
-		return info, nil
-	}
-
-	// Search through all repo indexes, tracking which repos contain the current version
-	var candidates []repoVersionInfo
-	cacheDir := c.settings.RepositoryCache
-
-	for _, r := range f.Repositories {
-		indexPath := filepath.Join(cacheDir, fmt.Sprintf("%s-index.yaml", r.Name))
-		indexFile, err := repo.LoadIndexFile(indexPath)
-		if err != nil {
-			log.Printf("[helm] skipping repo %q: failed to load index %s: %v", r.Name, indexPath, err)
-			continue
-		}
-
-		if versions, ok := indexFile.Entries[chartName]; ok {
-			var latestInRepo string
-			hasCurrentVersion := false
-			for _, v := range versions {
-				if latestInRepo == "" || compareVersions(v.Version, latestInRepo) > 0 {
-					latestInRepo = v.Version
-				}
-				if v.Version == currentVersion {
-					hasCurrentVersion = true
-				}
+		noClassicRepos = true
+	case len(f.Repositories) == 0:
+		noClassicRepos = true
+	default:
+		// Search through all repo indexes, tracking which repos contain the current version
+		cacheDir := c.settings.RepositoryCache
+		for _, r := range f.Repositories {
+			indexPath := filepath.Join(cacheDir, fmt.Sprintf("%s-index.yaml", r.Name))
+			indexFile, err := repo.LoadIndexFile(indexPath)
+			if err != nil {
+				log.Printf("[helm] skipping repo %q: failed to load index %s: %v", r.Name, indexPath, err)
+				indexLoadFailed = true
+				continue
 			}
-			if latestInRepo != "" {
-				candidates = append(candidates, repoVersionInfo{
-					repoName:          r.Name,
-					repoURL:           r.URL,
-					latestVersion:     latestInRepo,
-					hasCurrentVersion: hasCurrentVersion,
-				})
+
+			if versions, ok := indexFile.Entries[chartName]; ok {
+				var latestInRepo string
+				hasCurrentVersion := false
+				for _, v := range versions {
+					if latestInRepo == "" || compareVersions(v.Version, latestInRepo) > 0 {
+						latestInRepo = v.Version
+					}
+					if v.Version == currentVersion {
+						hasCurrentVersion = true
+					}
+				}
+				if latestInRepo != "" {
+					candidates = append(candidates, repoVersionInfo{
+						repoName:          r.Name,
+						repoURL:           r.URL,
+						latestVersion:     latestInRepo,
+						hasCurrentVersion: hasCurrentVersion,
+					})
+				}
 			}
 		}
 	}
 
 	if len(candidates) == 0 {
-		info.Error = "chart not found in configured repositories"
+		// A failed classic index could be hiding the release's real (classic)
+		// source, so surface that before OCI — matching resolveUpgradeChartPath —
+		// rather than mislabel a classic-repo release as OCI-tracked.
+		if indexLoadFailed {
+			info.Error = "failed to load one or more configured repository indexes"
+			return info, nil
+		}
+		// Genuine absence → registered OCI sources are the fallback for the user's
+		// own OCI-published charts. Only here, never on classic ambiguity below —
+		// falling back on ambiguity could advertise an OCI source for a release
+		// that actually came from a classic repo.
+		if c.applyOCIUpgrade(info, chartName, currentVersion, nil, nil) {
+			return info, nil
+		}
+		// Genuine untracked source — registering a chart source could fix it.
+		info.Untracked = true
+		if noClassicRepos && len(ListOCISources()) == 0 {
+			info.Error = "no chart sources configured"
+		} else {
+			info.Error = "chart not found in configured repositories or registered OCI sources"
+		}
 		return info, nil
 	}
 
@@ -1235,9 +1256,126 @@ func (c *Client) checkForUpgrade(namespace, name, username string, groups []stri
 
 	info.LatestVersion = latestVersion
 	info.RepositoryName = repoName
+	info.SourceType = "repository"
 	info.UpdateAvailable = compareVersions(latestVersion, currentVersion) > 0
 
 	return info, nil
+}
+
+// applyOCIUpgrade probes registered OCI sources for chartName and, if one
+// publishes it, fills info (LatestVersion/ChartRef/SourceType/UpdateAvailable)
+// and returns true. The classic-repo inference is always tried first; this is the
+// fallback for the user's own OCI-published charts that no repo index lists.
+func (c *Client) applyOCIUpgrade(info *UpgradeInfo, chartName, currentVersion string, lister ociTagLister, tagCache map[string][]string) bool {
+	match := c.discoverOCIUpgrade(chartName, lister, tagCache)
+	if match == nil {
+		return false
+	}
+	info.LatestVersion = match.LatestVersion
+	info.ChartRef = match.ChartURL
+	info.SourceType = "oci"
+	info.UpdateAvailable = compareVersions(match.LatestVersion, currentVersion) > 0
+	return true
+}
+
+// AvailableVersions is AvailableVersionsAsUser without impersonation.
+func (c *Client) AvailableVersions(namespace, name string) ([]string, error) {
+	return c.availableVersions(namespace, name, "", nil)
+}
+
+// AvailableVersionsAsUser returns the newest-first list of chart versions a
+// release could be upgraded (or downgraded) to, resolved from its source — the
+// matching classic repo's index or, failing that, a registered OCI source. Lets
+// the upgrade dialog offer a specific target version instead of only "latest".
+// Returns an empty list (not an error) when the source can't be determined; the
+// dialog then falls back to latest-only.
+func (c *Client) AvailableVersionsAsUser(namespace, name, username string, groups []string) ([]string, error) {
+	return c.availableVersions(namespace, name, username, groups)
+}
+
+func (c *Client) availableVersions(namespace, name, username string, groups []string) ([]string, error) {
+	var actionConfig *action.Configuration
+	var err error
+	if username != "" {
+		actionConfig, err = c.getActionConfigForUser(namespace, username, groups)
+	} else {
+		actionConfig, err = c.getActionConfig(namespace)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	rel, err := action.NewGet(actionConfig).Run(name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get release: %w", err)
+	}
+	chartName := rel.Chart.Metadata.Name
+
+	// Resolve the classic repo the same way the upgrade check does, then return
+	// that repo's full version list — never a union across repos, which could mix
+	// an unrelated same-named chart's versions.
+	var candidates []repoVersionInfo
+	versionsByRepo := map[string][]string{}
+	if f, err := repo.LoadFile(c.settings.RepositoryConfig); err == nil {
+		cacheDir := c.settings.RepositoryCache
+		for _, r := range f.Repositories {
+			idx, err := repo.LoadIndexFile(filepath.Join(cacheDir, fmt.Sprintf("%s-index.yaml", r.Name)))
+			if err != nil {
+				continue
+			}
+			entries, ok := idx.Entries[chartName]
+			if !ok {
+				continue
+			}
+			latest := ""
+			all := make([]string, 0, len(entries))
+			hasCurrent := false
+			for _, v := range entries {
+				all = append(all, v.Version)
+				if latest == "" || compareVersions(v.Version, latest) > 0 {
+					latest = v.Version
+				}
+				if v.Version == rel.Chart.Metadata.Version {
+					hasCurrent = true
+				}
+			}
+			if latest != "" {
+				candidates = append(candidates, repoVersionInfo{repoName: r.Name, repoURL: r.URL, latestVersion: latest, hasCurrentVersion: hasCurrent})
+				versionsByRepo[r.Name] = all
+			}
+		}
+	}
+
+	if len(candidates) > 0 {
+		sourceHosts := chartSourceHosts(rel.Chart.Metadata.Home, rel.Chart.Metadata.Sources)
+		if _, repoName := findBestUpgradeVersion(candidates, sourceHosts); repoName != "" {
+			return capVersions(sortVersionsDesc(versionsByRepo[repoName])), nil
+		}
+		// Ambiguous classic source — don't guess a version list.
+		return nil, nil
+	}
+
+	return capVersions(c.discoverOCIVersions(chartName)), nil
+}
+
+// maxAvailableVersions bounds the version list returned to the upgrade dialog.
+// Some charts publish hundreds of versions; the newest N covers realistic upgrade
+// targets without an unwieldy dropdown or a large payload. The list is already
+// sorted newest-first, so this keeps the most relevant versions.
+const maxAvailableVersions = 50
+
+func capVersions(versions []string) []string {
+	if len(versions) > maxAvailableVersions {
+		return versions[:maxAvailableVersions]
+	}
+	return versions
+}
+
+// sortVersionsDesc returns versions sorted newest-first by semver.
+func sortVersionsDesc(versions []string) []string {
+	out := slices.Clone(versions)
+	sort.SliceStable(out, func(i, j int) bool { return compareVersions(out[i], out[j]) > 0 })
+	return out
 }
 
 // repoVersionInfo holds version information from a single repository for upgrade comparison.
@@ -1601,11 +1739,25 @@ func (c *Client) upgradeWith(actionConfig *action.Configuration, name, targetVer
 	upgradeAction := action.NewUpgrade(actionConfig)
 	upgradeAction.Namespace = rel.Namespace
 	upgradeAction.Timeout = 120 * time.Second
-	upgradeAction.ReuseValues = true // Keep existing values
+	// Reset to the new chart's defaults, then re-merge the user's previously-supplied
+	// values on top — preserves their overrides while picking up the new chart's new
+	// default keys. Plain ReuseValues keeps the old merged values and can render nil
+	// for keys a newer chart added (a cross-version upgrade footgun).
+	upgradeAction.ResetThenReuseValues = true
 
 	// Use ChartPathOptions to locate/download the chart
 	client := action.NewInstall(actionConfig)
 	client.Version = targetVersion
+
+	// OCI pulls need a registry client on the action; Radar's action config
+	// doesn't carry one by default. Wire it from the user's helm registry login.
+	if registry.IsOCI(chartPath) {
+		rc, err := c.newRegistryClientConcrete()
+		if err != nil {
+			return fmt.Errorf("failed to build OCI registry client: %w", err)
+		}
+		client.SetRegistryClient(rc)
+	}
 
 	cp, err := client.ChartPathOptions.LocateChart(chartPath, c.settings)
 	if err != nil {
@@ -1617,6 +1769,13 @@ func (c *Client) upgradeWith(actionConfig *action.Configuration, name, targetVer
 	chart, err := loader.Load(cp)
 	if err != nil {
 		return fmt.Errorf("failed to load chart: %w", err)
+	}
+
+	// Refuse a silent chart-swap: the resolved source must publish the SAME chart
+	// the release runs, not merely a chart at the same version. Matters most for
+	// OCI prefix probing, where "<prefix>/<chartName>" is derived, not asserted.
+	if chart.Metadata != nil && chart.Metadata.Name != chartName {
+		return fmt.Errorf("resolved chart is %q but release %q runs chart %q — refusing to swap charts", chart.Metadata.Name, name, chartName)
 	}
 
 	sendProgress("upgrading", fmt.Sprintf("Applying %s %s...", chartName, targetVersion), "")
@@ -1638,9 +1797,15 @@ type chartPathCandidate struct {
 }
 
 func (c *Client) resolveUpgradeChartPath(chartName, targetVersion, repositoryName string, sourceHosts []string) (chartPath, resolvedRepo string, err error) {
+	// A missing/unreadable repo config is not fatal: a pure-OCI user has no
+	// repositories.yaml, and discovery may have advertised an OCI upgrade. Proceed
+	// with an empty classic set so the OCI fallback below can still resolve.
 	repos, err := repo.LoadFile(c.settings.RepositoryConfig)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to load repo file: %w", err)
+		if !os.IsNotExist(err) {
+			log.Printf("[helm] failed to load repository config during upgrade (treating as no classic repos): %v", err)
+		}
+		repos = &repo.File{}
 	}
 
 	var candidates []chartPathCandidate
@@ -1695,10 +1860,22 @@ func (c *Client) resolveUpgradeChartPath(chartName, targetVersion, repositoryNam
 		}
 		return "", "", fmt.Errorf("chart %s version %s not found in repository %s", chartName, targetVersion, repositoryName)
 	}
+
+	// Surface classic-repo index failures before the OCI fallback: a stale/missing
+	// index is a "fix your repo" condition the user should see, not something to
+	// silently paper over by pulling the same version from an OCI source.
 	if len(indexErrors) > 0 {
 		return "", "", fmt.Errorf("chart %s version %s not found in configured repositories; failed to load indexes: %s", chartName, targetVersion, strings.Join(indexErrors, "; "))
 	}
-	return "", "", fmt.Errorf("chart %s version %s not found in configured repositories", chartName, targetVersion)
+
+	// No classic-repo match and indexes loaded cleanly. Fall back to registered OCI
+	// sources — the server re-derives the oci:// ref from a configured prefix (never
+	// a client-supplied ref), keeping the upgrade path configured-only.
+	if url, ok := c.resolveOCIUpgradeURL(chartName, targetVersion); ok {
+		return url, "oci", nil
+	}
+
+	return "", "", fmt.Errorf("chart %s version %s not found in configured repositories or registered OCI sources", chartName, targetVersion)
 }
 
 // BatchCheckUpgrades checks for upgrades for all releases at once (more efficient)
@@ -1786,23 +1963,16 @@ func (c *Client) batchCheckUpgrades(namespace, username string, groups []string)
 		}
 	}
 
+	// A missing/unreadable repo config is not fatal: a user may rely solely on
+	// registered OCI sources, so we proceed with an empty classic-repo set and let
+	// the per-release OCI fallback run rather than failing every release here.
 	repoFile := c.settings.RepositoryConfig
 	f, err := repo.LoadFile(repoFile)
 	if err != nil {
-		message := fmt.Sprintf("failed to load Helm repositories: %v", err)
-		if os.IsNotExist(err) {
-			message = "no helm repositories configured"
-		} else {
-			log.Printf("[helm] failed to load repository config %s: %v", repoFile, err)
+		if !os.IsNotExist(err) {
+			log.Printf("[helm] failed to load repository config %s (treating as no classic repos): %v", repoFile, err)
 		}
-		for _, rel := range releases {
-			key := releaseUpgradeKey(rel, storageNamespaces[releaseStorageKey(rel)])
-			result.Releases[key] = &UpgradeInfo{
-				CurrentVersion: rel.Chart.Metadata.Version,
-				Error:          message,
-			}
-		}
-		return result, nil
+		f = &repo.File{}
 	}
 
 	// Split into two maps: latest-per-repo drives ranking; per-repo full
@@ -1812,11 +1982,13 @@ func (c *Client) batchCheckUpgrades(namespace, username string, groups []string)
 	chartAllVersions := make(map[string]map[string][]string)
 
 	cacheDir := c.settings.RepositoryCache
+	indexLoadFailed := false
 	for _, r := range f.Repositories {
 		indexPath := filepath.Join(cacheDir, fmt.Sprintf("%s-index.yaml", r.Name))
 		indexFile, err := repo.LoadIndexFile(indexPath)
 		if err != nil {
 			log.Printf("[helm] skipping repo %q: failed to load index %s: %v", r.Name, indexPath, err)
+			indexLoadFailed = true
 			continue
 		}
 
@@ -1845,26 +2017,58 @@ func (c *Client) batchCheckUpgrades(namespace, username string, groups []string)
 		}
 	}
 
+	// One registry client + tag cache shared across all releases in this batch, so
+	// the same OCI ref isn't re-listed per release. Built lazily on first miss so
+	// batches with no registered OCI sources pay nothing.
+	var ociLister ociTagLister
+	ociReady := false
+	tagCache := map[string][]string{}
+	ociFallback := func(info *UpgradeInfo, chartName, currentVersion string) bool {
+		if len(ListOCISources()) == 0 {
+			return false
+		}
+		if !ociReady {
+			ociLister = c.newRegistryClient()
+			ociReady = true
+		}
+		if ociLister == nil {
+			return false
+		}
+		return c.applyOCIUpgrade(info, chartName, currentVersion, ociLister, tagCache)
+	}
+
 	for _, rel := range releases {
 		key := releaseUpgradeKey(rel, storageNamespaces[releaseStorageKey(rel)])
 		currentVersion := rel.Chart.Metadata.Version
+		chartName := rel.Chart.Metadata.Name
 		info := &UpgradeInfo{CurrentVersion: currentVersion}
 
-		baseCandidates, ok := chartRepoVersions[rel.Chart.Metadata.Name]
+		baseCandidates, ok := chartRepoVersions[chartName]
 		if !ok {
-			info.Error = "chart not found in configured repositories"
+			// A failed classic index could be hiding this release's real source —
+			// surface that before OCI rather than mislabel it as OCI-tracked.
+			if indexLoadFailed {
+				info.Error = "failed to load one or more configured repository indexes"
+			} else if !ociFallback(info, chartName, currentVersion) {
+				// Genuine absence → OCI fallback for the user's own OCI charts.
+				info.Untracked = true
+				info.Error = "chart not found in configured repositories or registered OCI sources"
+			}
 			result.Releases[key] = info
 			continue
 		}
 
-		candidates := markCurrentVersion(baseCandidates, chartAllVersions[rel.Chart.Metadata.Name], currentVersion)
+		candidates := markCurrentVersion(baseCandidates, chartAllVersions[chartName], currentVersion)
 		sourceHosts := chartSourceHosts(rel.Chart.Metadata.Home, rel.Chart.Metadata.Sources)
 		latestVersion, repoName := findBestUpgradeVersion(candidates, sourceHosts)
 		if latestVersion == "" {
+			// Classic candidates exist but are ambiguous — don't let OCI override
+			// a release that came from a classic repo.
 			info.Error = "could not identify upstream chart repository"
 		} else {
 			info.LatestVersion = latestVersion
 			info.RepositoryName = repoName
+			info.SourceType = "repository"
 			info.UpdateAvailable = compareVersions(latestVersion, currentVersion) > 0
 		}
 		result.Releases[key] = info

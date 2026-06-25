@@ -2396,6 +2396,19 @@ export function useHelmUpgradeInfo(namespace: string, name: string, enabled = tr
   })
 }
 
+// Available chart versions for a release (newest-first), for the upgrade dialog's
+// version picker. Empty when the source can't be resolved — the dialog then falls
+// back to the latest version from upgrade-info.
+export function useHelmReleaseVersions(namespace: string, name: string, enabled = true) {
+  return useQuery<string[]>({
+    queryKey: ['helm-release-versions', namespace, name],
+    queryFn: () => fetchJSON(`/helm/releases/${namespace}/${name}/versions`),
+    enabled: Boolean(namespace && name && enabled),
+    staleTime: 30000,
+    retry: false,
+  })
+}
+
 // Batch check for upgrade availability (for list view)
 export function useHelmBatchUpgradeInfo(namespaces: string[] = [], enabled = true) {
   const params = helmNamespaceParams(namespaces)
@@ -2665,6 +2678,54 @@ export function useUpdateRepositorySilent() {
   return useMutation({
     mutationFn: updateRepositoryFn,
     onSuccess: () => invalidateHelmAfterRepoUpdate(queryClient),
+  })
+}
+
+// Registered OCI chart sources (the OCI analog of `helm repo add`). Used to
+// track upgrades for the user's own OCI-published charts.
+export function useHelmOCISources() {
+  return useQuery<string[]>({
+    queryKey: ['helm-oci-sources'],
+    queryFn: () => fetchJSON('/helm/oci-sources'),
+  })
+}
+
+async function mutateOCISource(method: 'POST' | 'DELETE', source: string): Promise<string[]> {
+  const response = await apiFetch(`${getApiBase()}/helm/oci-sources`, {
+    method,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ source }),
+  })
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ error: 'Unknown error' }))
+    throw new Error(error.error || `HTTP ${response.status}`)
+  }
+  return response.json()
+}
+
+// Invalidate the upgrade-info queries so a newly-registered source is probed
+// immediately and "source not tracked" re-resolves.
+function invalidateHelmAfterSourceChange(queryClient: ReturnType<typeof useQueryClient>) {
+  queryClient.invalidateQueries({ queryKey: ['helm-oci-sources'] })
+  queryClient.invalidateQueries({ queryKey: ['helm-upgrade-info'] })
+  queryClient.invalidateQueries({ queryKey: ['helm-batch-upgrade-info'] })
+}
+
+export function useAddOCISource() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (source: string) => mutateOCISource('POST', source),
+    meta: { errorMessage: 'Failed to add chart source', successMessage: 'Chart source added' },
+    onSuccess: () => invalidateHelmAfterSourceChange(queryClient),
+  })
+}
+
+export function useRemoveOCISource() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (source: string) => mutateOCISource('DELETE', source),
+    meta: { errorMessage: 'Failed to remove chart source', successMessage: 'Chart source removed' },
+    onSuccess: () => invalidateHelmAfterSourceChange(queryClient),
   })
 }
 

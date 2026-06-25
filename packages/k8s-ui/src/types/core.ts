@@ -649,7 +649,16 @@ export interface UpgradeInfo {
   latestVersion?: string
   updateAvailable: boolean
   repositoryName?: string
+  // 'repository' for classic HTTP-repo matches, 'oci' when discovered via a
+  // registered OCI chart source. Absent when the source couldn't be determined.
+  sourceType?: 'repository' | 'oci'
+  // oci:// chart reference an OCI-sourced upgrade lives at (display only).
+  chartRef?: string
   error?: string
+  // True only when the error is a genuinely untracked source (registering a
+  // chart source could fix it) — NOT for repo-side errors like a stale index or
+  // classic ambiguity. Gates the "track source" affordance.
+  untracked?: boolean
 }
 
 // Batch upgrade info keyed by "storageNamespace/name".

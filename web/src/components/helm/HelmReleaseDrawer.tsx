@@ -4,7 +4,7 @@ import { FetchResult, useDockReservedHeight, compareVersions } from '@skyhook-io
 import { startViewTransitionSafe } from '@skyhook-io/k8s-ui/utils/view-transition'
 import { TRANSITION_DRAWER } from '../../utils/animation'
 import { useRefreshAnimation } from '../../hooks/useRefreshAnimation'
-import { X, Copy, Check, RefreshCw, Package, Code, History, FileText, Settings, Link2, Anchor, GitFork, BookOpen, ArrowUpCircle, Trash2, GitBranch } from 'lucide-react'
+import { X, Copy, Check, RefreshCw, Package, Code, History, FileText, Settings, Link2, Anchor, GitFork, BookOpen, ArrowUpCircle, Trash2, GitBranch, AlertTriangle, RotateCcw, Clock } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { clsx } from 'clsx'
 import { useHelmRelease, useHelmManifest, useHelmValues, useHelmManifestDiff, useHelmUpgradeInfo, useHelmReleaseVersions, useHelmUninstall, upgradeWithProgress, rollbackWithProgress } from '../../api/client'
@@ -12,7 +12,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { ConfirmDialog } from '../ui/ConfirmDialog'
 import { Tooltip } from '../ui/Tooltip'
 import { Markdown } from '../ui/Markdown'
-import type { SelectedHelmRelease, HelmHook, ChartDependency } from '../../types'
+import type { SelectedHelmRelease, HelmHook, ChartDependency, HelmOperation } from '../../types'
 import type { NavigateToResource } from '../../utils/navigation'
 import { formatDate } from './helm-utils'
 import { getHelmStatusColor, SEVERITY_BADGE, SEVERITY_TEXT } from '../../utils/badge-colors'
@@ -513,6 +513,10 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
           <FetchResult loading={isLoading} error={releaseError} notFoundMessage="Release not found" className="h-32" />
         ) : (
           <>
+            <HelmOperationBanner
+              operation={releaseDetail.lastOperation}
+              managedByFluxHelmRelease={releaseDetail.managedByFluxHelmRelease}
+            />
             {activeTab === 'overview' && (
               <OverviewTab release={releaseDetail} onCopy={copyToClipboard} copied={copied} />
             )}
@@ -520,6 +524,7 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
               <RevisionHistory
                 history={releaseDetail.history}
                 currentRevision={releaseDetail.revision}
+                operations={mergeHelmOperations(releaseDetail.operations, releaseDetail.lastOperation)}
                 onViewRevision={handleViewRevision}
                 onCompare={handleCompareRevisions}
                 onRollback={canHelmWrite ? handleRollbackRequest : undefined}
@@ -710,6 +715,125 @@ function ProgressLog({ entries }: { entries: { phase: string; message: string }[
         </div>
       ))}
     </div>
+  )
+}
+
+function mergeHelmOperations(operations: HelmOperation[] | undefined, lastOperation: HelmOperation | undefined): HelmOperation[] {
+  const merged: HelmOperation[] = []
+  const seen = new Set<string>()
+  for (const op of [...(operations || []), ...(lastOperation ? [lastOperation] : [])]) {
+    const key = helmOperationKey(op)
+    if (seen.has(key)) continue
+    seen.add(key)
+    merged.push(op)
+  }
+  return merged
+}
+
+function helmOperationKey(operation: HelmOperation): string {
+  return [
+    operation.kind,
+    operation.status,
+    operation.revision || 0,
+    operation.failedRevision || 0,
+    operation.rollbackRevision || 0,
+    operation.targetRevision || 0,
+  ].join(':')
+}
+
+function HelmOperationBanner({
+  operation,
+  managedByFluxHelmRelease,
+}: {
+  operation?: HelmOperation
+  managedByFluxHelmRelease?: string
+}) {
+  if (!operation || !shouldShowOperationBanner(operation)) {
+    return null
+  }
+
+  const isFailure = operation.status === 'failed'
+  const isPending = operation.status === 'stuck_pending'
+  const tone: 'error' | 'warning' | 'info' = isFailure ? 'error' : operation.kind === 'rollback' ? 'info' : 'warning'
+  const Icon = operation.kind === 'upgrade_rolled_back' || operation.kind === 'rollback' ? RotateCcw : isPending ? Clock : AlertTriangle
+  const title = operationTitle(operation)
+
+  return (
+    <div className="m-4 mb-0 card-inner-lg">
+      <div className="flex items-start gap-3">
+        <Icon className={clsx('mt-0.5 h-5 w-5 shrink-0', SEVERITY_TEXT[tone])} />
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-sm font-medium text-theme-text-primary">{title}</span>
+            <span className={clsx('badge-sm', SEVERITY_BADGE[tone])}>{operation.status.replace(/_/g, ' ')}</span>
+            <OperationRevisionChips operation={operation} />
+          </div>
+          <p className="mt-1 text-sm text-theme-text-secondary">{operation.message}</p>
+          {operation.failureDescription && (
+            <p className="mt-1 text-xs text-theme-text-tertiary truncate">
+              {operation.failureDescription}
+            </p>
+          )}
+          {operation.kind === 'upgrade_rolled_back' && (
+            <p className="mt-1 text-xs text-theme-text-tertiary">
+              Helm history does not record whether <code className="inline-code text-[11px]">--atomic</code> was set; the rollback is inferred from adjacent release revisions.
+            </p>
+          )}
+          {managedByFluxHelmRelease && (
+            <p className="mt-1 text-xs text-theme-text-tertiary">
+              This release is managed by Flux HelmRelease {managedByFluxHelmRelease}; direct Helm changes may be reconciled back.
+            </p>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function shouldShowOperationBanner(operation: HelmOperation): boolean {
+  return operation.kind === 'upgrade_rolled_back' || operation.kind === 'rollback' || operation.status === 'failed' || operation.status === 'stuck_pending'
+}
+
+function operationTitle(operation: HelmOperation): string {
+  switch (operation.kind) {
+    case 'upgrade_rolled_back':
+      return 'Helm rolled back after failed upgrade'
+    case 'rollback':
+      return 'Helm rollback applied'
+    case 'pending':
+      return 'Helm operation may be stuck'
+    case 'upgrade_failed':
+      return 'Helm upgrade failed'
+    case 'release_failed':
+      return 'Helm release failed'
+    default:
+      return 'Helm operation'
+  }
+}
+
+function OperationRevisionChips({ operation }: { operation: HelmOperation }) {
+  const chips: Array<{ key: string; label: string; className: string }> = []
+  if (operation.failedRevision) {
+    chips.push({ key: 'failed', label: `failed rev ${operation.failedRevision}`, className: SEVERITY_BADGE.error })
+  }
+  if (operation.rollbackRevision) {
+    chips.push({ key: 'rollback', label: `rollback rev ${operation.rollbackRevision}`, className: SEVERITY_BADGE.warning })
+  }
+  if (operation.targetRevision) {
+    chips.push({ key: 'target', label: `target rev ${operation.targetRevision}`, className: SEVERITY_BADGE.info })
+  }
+  if (!operation.failedRevision && !operation.rollbackRevision && operation.revision) {
+    chips.push({ key: 'revision', label: `rev ${operation.revision}`, className: SEVERITY_BADGE.neutral })
+  }
+  if (chips.length === 0) {
+    return null
+  }
+  return (
+    <>
+      {chips.map((chip) => (
+        <span key={chip.key} className={clsx('badge-sm', chip.className)}>{chip.label}</span>
+      ))}
+    </>
   )
 }
 

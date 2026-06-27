@@ -554,6 +554,8 @@ export interface HelmRelease {
   status: string
   revision: number
   updated: string // ISO date string
+  lastOperation?: HelmOperation
+  operations?: HelmOperation[]
   // Health summary from owned resources
   resourceHealth?: 'healthy' | 'degraded' | 'unhealthy' | 'unknown'
   healthIssue?: string    // Primary issue if unhealthy (e.g., "OOMKilled")
@@ -574,6 +576,27 @@ export interface HelmRevision {
   updated: string // ISO date string
 }
 
+export type HelmOperationKind = 'release_failed' | 'upgrade_failed' | 'upgrade_rolled_back' | 'rollback' | 'pending'
+export type HelmOperationStatus = 'failed' | 'rolled_back' | 'completed' | 'stuck_pending'
+export type HelmOperationConfidence = 'high' | 'medium' | 'low'
+export type HelmOperationSource = 'helm_status' | 'helm_history'
+
+export interface HelmOperation {
+  kind: HelmOperationKind
+  status: HelmOperationStatus
+  source: HelmOperationSource
+  confidence: HelmOperationConfidence
+  message: string
+  evidence?: string
+  failureDescription?: string
+  revision?: number
+  failedRevision?: number
+  rollbackRevision?: number
+  targetRevision?: number
+  pendingStatus?: string
+  updated?: string
+}
+
 export interface HelmReleaseDetail {
   name: string
   namespace: string
@@ -589,9 +612,14 @@ export interface HelmReleaseDetail {
   notes: string
   history: HelmRevision[]
   resources: HelmOwnedResource[]
+  resourceHealth?: 'healthy' | 'degraded' | 'unhealthy' | 'unknown'
+  healthIssue?: string
+  healthSummary?: string
   hooks?: HelmHook[]
   readme?: string
   dependencies?: ChartDependency[]
+  lastOperation?: HelmOperation
+  operations?: HelmOperation[]
   // When set, this release was installed by Flux's helm-controller — see
   // HelmRelease.managedByFluxHelmRelease for context. Format: "namespace/name".
   managedByFluxHelmRelease?: string

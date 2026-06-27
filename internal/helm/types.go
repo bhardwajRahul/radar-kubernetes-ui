@@ -2,20 +2,26 @@ package helm
 
 import (
 	"time"
+
+	"github.com/skyhook-io/radar/pkg/helmhistory"
 )
+
+type HelmOperation = helmhistory.Operation
 
 // HelmRelease represents a Helm release in the list view
 type HelmRelease struct {
 	Name      string `json:"name"`
 	Namespace string `json:"namespace"`
 	// Empty means Helm stores release metadata in Namespace.
-	StorageNamespace string    `json:"storageNamespace,omitempty"`
-	Chart            string    `json:"chart"`
-	ChartVersion     string    `json:"chartVersion"`
-	AppVersion       string    `json:"appVersion"`
-	Status           string    `json:"status"`
-	Revision         int       `json:"revision"`
-	Updated          time.Time `json:"updated"`
+	StorageNamespace string          `json:"storageNamespace,omitempty"`
+	Chart            string          `json:"chart"`
+	ChartVersion     string          `json:"chartVersion"`
+	AppVersion       string          `json:"appVersion"`
+	Status           string          `json:"status"`
+	Revision         int             `json:"revision"`
+	Updated          time.Time       `json:"updated"`
+	LastOperation    *HelmOperation  `json:"lastOperation,omitempty"`
+	Operations       []HelmOperation `json:"operations,omitempty"`
 	// Health summary from owned resources
 	ResourceHealth string `json:"resourceHealth,omitempty"` // healthy, degraded, unhealthy, unknown
 	HealthIssue    string `json:"healthIssue,omitempty"`    // Primary issue if unhealthy (e.g., "OOMKilled")
@@ -55,9 +61,14 @@ type HelmReleaseDetail struct {
 	Notes            string            `json:"notes"`
 	History          []HelmRevision    `json:"history"`
 	Resources        []OwnedResource   `json:"resources"`
+	ResourceHealth   string            `json:"resourceHealth,omitempty"`
+	HealthIssue      string            `json:"healthIssue,omitempty"`
+	HealthSummary    string            `json:"healthSummary,omitempty"`
 	Hooks            []HelmHook        `json:"hooks,omitempty"`
 	Readme           string            `json:"readme,omitempty"`
 	Dependencies     []ChartDependency `json:"dependencies,omitempty"`
+	LastOperation    *HelmOperation    `json:"lastOperation,omitempty"`
+	Operations       []HelmOperation   `json:"operations,omitempty"`
 	// See HelmRelease.ManagedByFluxHelmRelease.
 	ManagedByFluxHelmRelease string `json:"managedByFluxHelmRelease,omitempty"`
 }
@@ -318,4 +329,35 @@ func StatusPriority(status, resourceHealth string) int {
 		return 3
 	}
 	return 4
+}
+
+// ReleasePriority returns a sort priority for Helm release rows.
+// Lower values sort first. Operation-aware callers should prefer this over
+// StatusPriority so recovered failed upgrades are not buried as ordinary
+// healthy deployed releases.
+func ReleasePriority(r HelmRelease) int {
+	if r.Status == "failed" {
+		return 0
+	}
+	if r.Status == "pending-install" || r.Status == "pending-upgrade" || r.Status == "pending-rollback" {
+		return 1
+	}
+	if r.LastOperation != nil {
+		switch r.LastOperation.Kind {
+		case helmhistory.KindUpgradeFailed, helmhistory.KindReleaseFailed, helmhistory.KindPending:
+			return 1
+		case helmhistory.KindUpgradeRolledBack:
+			return 2
+		}
+	}
+	switch r.ResourceHealth {
+	case "unhealthy":
+		return 3
+	case "degraded":
+		return 4
+	}
+	if r.LastOperation != nil && r.LastOperation.Kind == helmhistory.KindRollback {
+		return 5
+	}
+	return 6
 }

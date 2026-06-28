@@ -35,8 +35,8 @@ import { PrometheusCharts, isPrometheusSupported } from '../resource/PrometheusC
 import { PrometheusChartsGrid } from '../resource/PrometheusChartsGrid'
 import { RestartEventLane } from '../resource/RestartChart'
 import { RightsizingStrip } from '../resource/RightsizingStrip'
-import { useResourceAudit, useResources } from '../../api/client'
-import { AuditAlerts } from '@skyhook-io/k8s-ui'
+import { useResourceAudit, useResourceIssues, useResources } from '../../api/client'
+import { AuditAlerts, ResourceIssuesSection } from '@skyhook-io/k8s-ui'
 import { WorkloadLogsViewer } from '../logs/WorkloadLogsViewer'
 import { LogsViewer } from '../logs/LogsViewer'
 import { useCanUpdateSecrets, useCanNodeWrite, useNamespacedCapabilities, useIsLocalDeployment } from '../../contexts/CapabilitiesContext'
@@ -421,6 +421,15 @@ export function WorkloadView({
     () => (resource?.apiVersion ? apiVersionToGroup(resource.apiVersion) : undefined),
     [resource?.apiVersion],
   )
+  // Live Operational Issues for this resource. Fetched here (not inside the lead
+  // render-prop) so the count also gates `hasOperationalIssues` — which tells the
+  // renderers to suppress their own status-derived problems and avoid duplicates.
+  // Keyed on the STABLE prop kind+group (same inputs as the resource fetch above),
+  // NOT the manifest-derived ones: deriving kind/group from the loaded resource
+  // would flip the query key when the manifest arrives, drop liveIssues, and flash
+  // the renderer banners. The backend canonicalizes a plural kind via discovery,
+  // so passing the route's plural kindProp resolves correctly.
+  const { data: liveIssues } = useResourceIssues(kindProp, rest.group, namespace, name)
   const { onCompareTo, onCompareAcrossClusters, picker: comparePicker } = useCompareLauncher({
     kind: kindProp,
     namespace,
@@ -527,6 +536,8 @@ export function WorkloadView({
           <FluxSourceConsumersSection kind={k} namespace={ns} name={n} />
         </>
       )}
+      renderOverviewLead={() => <ResourceIssuesSection issues={liveIssues} />}
+      hasOperationalIssues={!!liveIssues?.length}
       onOpenGitOpsResource={gitopsOwnerQuery.data ? handleOpenGitOpsResource : undefined}
       resolvedGitOpsOwner={gitopsOwner}
       gitOpsOwnerVerified={gitOpsOwnerVerified}

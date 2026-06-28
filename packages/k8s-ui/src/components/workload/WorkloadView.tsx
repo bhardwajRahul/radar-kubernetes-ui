@@ -52,7 +52,7 @@ import { ResourceRendererDispatch, getResourceStatus, type RendererOverrides } f
 import type { ScalerDiagnosis } from '../resources/renderers/WorkloadRenderer'
 import { DetailShell, type DetailShellTab } from '../shared/DetailShell'
 import { HelmManagedByChip, ManagedByChip, type HelmOwnerRef } from '../shared/ManagedByChip'
-import { getKindColorOutline, displayKindName } from '../ui/drawer-components'
+import { getKindColorOutline, displayKindName, OperationalIssuesShownContext } from '../ui/drawer-components'
 import { midTruncate } from '../../utils/format'
 
 export type WorkloadTabType = 'overview' | 'topology' | 'timeline' | 'logs' | 'metrics' | 'yaml'
@@ -211,6 +211,17 @@ interface WorkloadViewProps {
   isMetricsAvailable?: (kind: string, resource: any) => boolean
   /** Render extra content at the bottom of the overview tab (e.g. audit findings) */
   renderOverviewExtra?: (props: { kind: string; namespace: string; name: string }) => ReactNode
+  /** Render content at the TOP of the overview tab, above the renderer (e.g. live
+   *  Operational Issues). Optional + additive — consumers that don't pass it are
+   *  unaffected. Only rendered when `hasOperationalIssues` is true: the lead
+   *  component returns null when empty, but its padded wrapper can't tell, so
+   *  gating on the flag avoids an empty top gap on healthy resources. */
+  renderOverviewLead?: (props: { kind: string; namespace: string; name: string }) => ReactNode
+  /** When true, renderers suppress their own status-derived problem displays
+   *  because a dedicated Operational Issues section is shown (the host fetched
+   *  live issues for this resource). Avoids showing the same failure twice.
+   *  Also gates the `renderOverviewLead` wrapper (see above). */
+  hasOperationalIssues?: boolean
 
   // ── Duplicate ────────────────────────────────────────────────────────────
   /** Duplicate handler — opens create dialog with this resource's YAML */
@@ -282,6 +293,8 @@ export function WorkloadView({
   onDuplicate,
   onDownload,
   renderOverviewExtra,
+  renderOverviewLead,
+  hasOperationalIssues,
   // Actions bar
   actionsBarProps,
   // Renderer overrides
@@ -654,7 +667,12 @@ export function WorkloadView({
               onDownload={onDownload}
             />
           ) : (
-            <>
+            <OperationalIssuesShownContext.Provider value={!!hasOperationalIssues}>
+              {renderOverviewLead && hasOperationalIssues && (
+                <div className="px-4 pt-4">
+                  {renderOverviewLead({ kind, namespace, name })}
+                </div>
+              )}
               <ResourceRendererDispatch
                 resource={selectedResource}
                 data={resource}
@@ -681,7 +699,7 @@ export function WorkloadView({
                   {renderOverviewExtra({ kind, namespace, name })}
                 </div>
               )}
-            </>
+            </OperationalIssuesShownContext.Provider>
           )}
         </div>
       </div>
@@ -690,6 +708,7 @@ export function WorkloadView({
 
   // ── Expanded (full) mode ─────────────────────────────────────────────────
   return (
+    <OperationalIssuesShownContext.Provider value={!!hasOperationalIssues}>
     <DetailShell
       breadcrumb={breadcrumb}
       nav={
@@ -804,6 +823,7 @@ export function WorkloadView({
               eventsError={overviewEventsError}
               updatesError={resourceFocusedUpdatesError}
               extraContent={renderOverviewExtra && renderOverviewExtra({ kind, namespace, name })}
+              leadContent={hasOperationalIssues && renderOverviewLead ? renderOverviewLead({ kind, namespace, name }) : undefined}
             />
         )}
         {effectiveTab === 'topology' && (
@@ -903,6 +923,7 @@ export function WorkloadView({
           </div>
         )}
     </DetailShell>
+    </OperationalIssuesShownContext.Provider>
   )
 }
 
@@ -1337,6 +1358,7 @@ function InfoTab({
   eventsError,
   updatesError,
   extraContent,
+  leadContent,
 }: {
   resource: any
   selectedResource: SelectedResource
@@ -1360,6 +1382,7 @@ function InfoTab({
   eventsError?: Error | null
   updatesError?: Error | null
   extraContent?: ReactNode
+  leadContent?: ReactNode
 }) {
   if (!resource) {
     return <FetchResult loading={isLoading} error={error} className="h-full" />
@@ -1367,6 +1390,11 @@ function InfoTab({
 
   return (
     <div className="h-full overflow-auto">
+      {leadContent && (
+        <div className="px-4 pt-4">
+          {leadContent}
+        </div>
+      )}
       <ResourceRendererDispatch
         resource={selectedResource}
         data={resource}

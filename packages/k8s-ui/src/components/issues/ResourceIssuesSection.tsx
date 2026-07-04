@@ -3,7 +3,7 @@ import { Section } from '../ui/drawer-components'
 import { Badge } from '../ui/Badge'
 import type { Issue, IssueResourceRef } from './types'
 import { categoryLabel } from './severity'
-import { diagnosticRoleLabel, diagnosticFactLabel, confidenceTitle } from './diagnostic'
+import { diagnosticRoleLabel, diagnosticFactLabel, confidenceTitle, incidentParentLabel } from './diagnostic'
 
 /**
  * ResourceIssuesSection — the compact "Operational Issues" block for the resource
@@ -14,7 +14,7 @@ import { diagnosticRoleLabel, diagnosticFactLabel, confidenceTitle } from './dia
  *
  * Header mirrors the queue: the plain `categoryLabel` is the operator-facing
  * headline and the raw `reason` rides alongside as a muted signal (so the K8s
- * jargon is available but not the lead). Body is intentionally just the plain
+ * jargon is available but not the lead). Body is primarily the plain
  * `cause` (which names the offending object) + the `Next step` — the diagnosis
  * and the fix. The raw `message`/evidence stays in the queue + MCP where the
  * locator detail is wanted; inline it mostly restated the cause or the category,
@@ -34,6 +34,7 @@ export function ResourceIssuesSection({
     <Section title={`Operational Issues (${issues.length})`} icon={AlertTriangle} defaultExpanded>
       <div className="space-y-3">
         {issues.map((issue) => {
+          const parent = issue.incident_parent
           return (
             <div key={issue.id} className="card-inner">
               <div className="mb-1 flex min-w-0 items-baseline gap-2">
@@ -63,6 +64,24 @@ export function ResourceIssuesSection({
                 <p className="mt-1 text-xs text-theme-text-tertiary">
                   Suggested fix: create namespace{' '}
                   <code className="rounded bg-theme-elevated px-1 font-mono">{issue.remediation_target}</code> — apply it from the GitOps detail page.
+                </p>
+              ) : null}
+              {parent ? (
+                <p className="mt-1 text-xs text-theme-text-tertiary">
+                  {incidentParentLabel(parent.fact_type, parent.confidence)}:{' '}
+                  {onResourceClick ? (
+                    <button
+                      type="button"
+                      onClick={() => onResourceClick(parent.ref)}
+                      className="group inline-flex items-center gap-1 text-left font-mono hover:text-theme-text-secondary"
+                      title={confidenceTitle(parent.confidence ?? '')}
+                    >
+                      {parent.ref.kind} / {parent.ref.name}
+                      <ExternalLink className="h-3 w-3 opacity-0 group-hover:opacity-100" />
+                    </button>
+                  ) : (
+                    <span className="font-mono">{parent.ref.kind} / {parent.ref.name}</span>
+                  )}
                 </p>
               ) : null}
               <CausalContext issue={issue} onResourceClick={onResourceClick} />

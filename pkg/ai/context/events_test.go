@@ -25,6 +25,118 @@ func makeEvent(reason, message, eventType string, count int32, lastTime time.Tim
 	}
 }
 
+// Serial incarnations of one chronic failure must be ONE group. Messages
+// verbatim from a live cluster: an Argo cron workflow fails every tick, and
+// each run's epoch-suffixed name plus child-node ID used to survive
+// normalization as distinct digit tails ("<pod>05865" vs "<pod>0114"),
+// filling 11 of 20 dashboard rows with one failure.
+func TestNormalizeMessage_CollapsesSerialNumericIncarnations(t *testing.T) {
+	pairs := [][2]string{
+		{
+			"Failed node radar-batch-cronworkflow-1784443200: child 'radar-batch-cronworkflow-1784443200-1321105865' failed",
+			"Failed node radar-batch-cronworkflow-1784442600: child 'radar-batch-cronworkflow-1784442600-331300114' failed",
+		},
+		{
+			"child 'radar-batch-cronworkflow-1784443200-1321105865' failed",
+			"child 'radar-batch-cronworkflow-1784442000-1354049248' failed",
+		},
+		// cert-manager Order/Challenge names carry decimal FNV suffixes
+		// (<=10 digits; a 5-digit render falls to podHashPattern instead).
+		{
+			"Created Order resource shop/example-cert-4082662562",
+			"Created Order resource shop/example-cert-1193317457",
+		},
+		// Kubelet SystemOOM embeds the ephemeral PID — identity, never
+		// magnitude — so repeated kills of one process are one story.
+		{
+			"System OOM encountered, victim process: java, pid: 1234567",
+			"System OOM encountered, victim process: java, pid: 7654321",
+		},
+		// CronJob MissSchedule emits RFC1123Z timestamps, repeatedly for a
+		// chronically missing schedule; the ISO tsPattern never matched
+		// these, so each emission formed a new group.
+		{
+			"Missed scheduled time to start a job: Sun, 19 Jul 2026 12:30:00 +0000",
+			"Missed scheduled time to start a job: Sat, 18 Jul 2026 09:10:00 +0000",
+		},
+	}
+	for _, p := range pairs {
+		a, b := normalizeMessage(p[0]), normalizeMessage(p[1])
+		if a != b {
+			t.Errorf("incarnations did not collapse:\n  %q -> %q\n  %q -> %q", p[0], a, p[1], b)
+		}
+	}
+}
+
+// The >=6-digit floor must NOT merge messages whose small numbers are
+// meaningful: ports, HTTP status codes, exit codes, replica fractions.
+func TestNormalizeMessage_PreservesMeaningfulSmallNumbers(t *testing.T) {
+	distinct := [][2]string{
+		// Same-shaped probe failures on different ports are different probes.
+		{
+			`Liveness probe failed: Get "http://svc:9440/healthz": context deadline exceeded`,
+			`Liveness probe failed: Get "http://svc:8082/healthz": context deadline exceeded`,
+		},
+		{"Readiness probe failed: HTTP probe failed with statuscode: 500", "Readiness probe failed: HTTP probe failed with statuscode: 503"},
+		{"Error (exit code 64): task failed", "Error (exit code 137): task failed"},
+		{"0/9 nodes are available", "0/3 nodes are available"},
+		// Freestanding large quantities are diagnostic values, not name
+		// segments — the word-boundary anchor keeps them distinct.
+		{"Container was using 123456789, request is 100000000", "Container was using 987654321, request is 100000000"},
+		{"attempting to reclaim 512000000 bytes of ephemeral-storage", "attempting to reclaim 128000000 bytes of ephemeral-storage"},
+		// A hyphen NOT preceded by a word character is a sign or a flag,
+		// not a name segment (\b anchor): negative metric values and
+		// --flag-style tokens stay distinct.
+		{"current metric value: -123456789", "current metric value: -987654321"},
+		{"unknown flag: --123456", "unknown flag: --654321"},
+	}
+	for _, p := range distinct {
+		a, b := normalizeMessage(p[0]), normalizeMessage(p[1])
+		if a == b {
+			t.Errorf("meaningful numbers were merged: %q and %q both -> %q", p[0], p[1], a)
+		}
+	}
+}
+
+// CronJob/Job pod names are {name}-{unixMinutes}-{rand5}. The long-number
+// placeholder must stay inside [a-z0-9] so podHashPattern still consumes the
+// whole name — an out-of-class token would leave the rand5 tail and split
+// same-shaped events per incarnation (the regression this pins).
+func TestNormalizeMessage_CronJobPodNamesStillCollapse(t *testing.T) {
+	a := normalizeMessage("Back-off restarting failed container in pod mycron-29184720-abcde")
+	b := normalizeMessage("Back-off restarting failed container in pod mycron-29184721-fghij")
+	if a != b {
+		t.Errorf("CronJob pod incarnations split: %q vs %q", a, b)
+	}
+}
+
+// Pattern-order pins. A digit-heavy UUID must still normalize as <uuid> —
+// longNumPattern running first would mangle it into "<n>-1234-…" and split
+// same-shaped messages by UUID composition. IPs keep their <ip> placeholder.
+func TestNormalizeMessage_SpecificPatternsWinOverLongNum(t *testing.T) {
+	a := normalizeMessage("volume 12345678-1234-1234-1234-123456789012 mount failed")
+	b := normalizeMessage("volume a1b2c3d4-e5f6-7890-abcd-ef1234567890 mount failed")
+	if a != b {
+		t.Errorf("UUID normalization diverged by digit composition: %q vs %q", a, b)
+	}
+	if got := normalizeMessage("dial tcp 10.192.5.18:8081: connect: connection refused"); !strings.Contains(got, "<ip>") {
+		t.Errorf("IP not normalized as <ip>: %q", got)
+	}
+}
+
+// Documented, accepted debt (pre-existing, NOT introduced by longNumPattern):
+// podHashPattern's shape also matches ordinary hyphenated word pairs, so
+// same-shaped messages differing only in such a pair over-merge. Real
+// mis-grouping additionally requires identical reason and type. This test
+// pins the behavior so a future podHashPattern redesign notices it.
+func TestNormalizeMessage_KnownHyphenatedPhraseOverMerge(t *testing.T) {
+	a := normalizeMessage("error: connection-refused by peer")
+	b := normalizeMessage("error: connection-timeout by peer")
+	if a != b {
+		t.Errorf("hyphenated-phrase over-merge no longer occurs (%q vs %q) — podHashPattern changed; update this documented-debt test and audit grouping", a, b)
+	}
+}
+
 func TestDeduplicateEvents_CollapseIdentical(t *testing.T) {
 	now := time.Now()
 	events := make([]corev1.Event, 50)

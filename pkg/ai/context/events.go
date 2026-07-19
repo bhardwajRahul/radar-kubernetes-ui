@@ -39,12 +39,47 @@ var (
 	uuidPattern    = regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
 	tsPattern      = regexp.MustCompile(`\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}`)
 	ipPattern      = regexp.MustCompile(`\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?`)
+	// Runs of >=6 digits attached to a NAME (\b requires a word character
+	// before the hyphen without consuming it, so adjacent segments like
+	// name-{epoch}-{childID} both match) are generated name segments: epoch
+	// suffixes in Argo cron workflow and CronJob pod names, controller
+	// child-node IDs, cert-manager Order/Challenge FNV suffixes.
+	// podHashPattern's {5,10} bound only partially consumes them, leaving
+	// distinct digit tails that split one chronic failure into a new group
+	// per incarnation. The word-boundary anchor restricts this to identifier
+	// context: freestanding quantities (eviction thresholds, byte counts —
+	// "using 123456789") and negative values ("value: -123456789") stay
+	// distinct, and the >=6 floor additionally preserves ports, HTTP status
+	// codes, and exit codes.
+	longNumPattern = regexp.MustCompile(`\b-\d{6,}`)
+	// CronJob MissSchedule emits RFC1123Z ("Sun, 19 Jul 2026 12:30:00
+	// +0000"), repeatedly for a chronically missing schedule — the ISO
+	// tsPattern doesn't touch it, so each emission formed a new group.
+	rfc1123ZPattern = regexp.MustCompile(`\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} [+-]\d{4}`)
+	// Kubelet SystemOOM ("victim process: X, pid: 1234567") embeds the
+	// ephemeral PID — identity, never magnitude — so repeated OOMs split
+	// per kill. All widths normalized: a 5-digit PID is no more meaningful
+	// than a 7-digit one.
+	pidPattern = regexp.MustCompile(`\bpid: \d+\b`)
 )
 
 func normalizeMessage(msg string) string {
+	// longNumPattern runs AFTER the specific patterns — a digit-heavy UUID
+	// segment or IP would otherwise be eaten before uuidPattern/ipPattern
+	// can recognize it — and BEFORE podHashPattern, whose {5,10} bound is
+	// what leaves the digit tails.
+	//
+	// Its placeholder must stay inside [a-z0-9]: CronJob pod names are
+	// {name}-{unixMinutes}-{rand5}, and an out-of-class token (e.g. "<n>")
+	// in the middle would stop podHashPattern from consuming the whole
+	// name, splitting same-shaped events on the rand5 tail — the exact
+	// per-incarnation splitting this pattern exists to fix.
 	s := uuidPattern.ReplaceAllString(msg, "<uuid>")
 	s = tsPattern.ReplaceAllString(s, "<timestamp>")
+	s = rfc1123ZPattern.ReplaceAllString(s, "<timestamp>")
 	s = ipPattern.ReplaceAllString(s, "<ip>")
+	s = pidPattern.ReplaceAllString(s, "pid: <pid>")
+	s = longNumPattern.ReplaceAllString(s, "-nnnnnn")
 	s = podHashPattern.ReplaceAllString(s, "<pod>")
 	return s
 }

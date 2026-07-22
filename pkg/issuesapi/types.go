@@ -438,6 +438,15 @@ type Response struct {
 	ClusterContext      *ClusterContext `json:"cluster_context,omitempty"`
 	RecentChanges       []RecentChange  `json:"recent_changes,omitempty"`
 	RecentChangesReason string          `json:"recent_changes_reason,omitempty"`
+	// Agent-facing steer accompanying reasons whose timing evidence could be
+	// misread as "the changes are irrelevant" — advice on how to treat the
+	// feed, never a causal claim about any specific change.
+	RecentChangesGuidance string `json:"recent_changes_guidance,omitempty"`
+	// A missing change under truncation is unknown, not evidence that no
+	// relevant change occurred in the lookback window. False only vouches for
+	// the lookback window itself: changes older than the window are out of
+	// scope either way, not implied absent.
+	RecentChangesTruncated bool `json:"recent_changes_truncated,omitempty"`
 	// CorrelationTruncated is set when per-issue change correlation skipped
 	// some critical or warning issues (shared cap reached; criticals are
 	// checked first). Under truncation, an issue without correlation markers

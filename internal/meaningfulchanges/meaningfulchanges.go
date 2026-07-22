@@ -27,9 +27,29 @@ const (
 )
 
 const (
-	ChangesReasonNoCriticalIssues             = "no_critical_issues"
-	ChangesReasonAllCriticalStartedAtCreation = "all_critical_issues_started_at_resource_creation"
+	ChangesReasonNoCriticalIssues                  = "no_critical_issues"
+	ChangesReasonWithAllCreationTimeCriticalIssues = "recent_changes_with_all_critical_issues_at_creation"
 )
+
+// IssueChangesGuidance returns response-level steering prose for reason tokens
+// whose timing evidence could otherwise read as "the changes are irrelevant."
+// The steer rides the response — not just the tool description — because the
+// response is what the model attends to at decision time; the description may
+// be skimmed once or never loaded. It is advice about how to treat the feed,
+// never a causal claim about any specific change.
+func IssueChangesGuidance(reason string) string {
+	if reason != ChangesReasonWithAllCreationTimeCriticalIssues {
+		return ""
+	}
+	// State only what the timing classification establishes: each critical row
+	// has been failing since its own resource was created. That is NOT an
+	// ordering against the change feed — a resource created after a bad change
+	// fails from creation precisely BECAUSE of that change.
+	return "Every returned critical issue is classified as failing since its resource was created. " +
+		"That does not clear the listed changes: a change can break a resource created after it, " +
+		"and can cause application-layer symptoms that produce no issue row. " +
+		"Review the changes before concluding the listed issues explain the reported problem."
+}
 
 var (
 	configKinds = []string{"ConfigMap"}
@@ -189,7 +209,7 @@ func IssueChangesReason(issues []issuesapi.Issue) string {
 	if criticalCount == 0 {
 		return ChangesReasonNoCriticalIssues
 	}
-	return ChangesReasonAllCriticalStartedAtCreation
+	return ChangesReasonWithAllCreationTimeCriticalIssues
 }
 
 func ConfigMapKind(kind string) bool {

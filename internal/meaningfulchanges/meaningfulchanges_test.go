@@ -22,15 +22,15 @@ func TestShouldAttachIssueChanges(t *testing.T) {
 	if !ShouldAttachIssueChanges(nil) {
 		t.Fatalf("zero critical issues should allow the recent-changes attachment")
 	}
-	if got := IssueChangesReason(nil); got != ChangesReasonNoCriticalIssues {
-		t.Fatalf("IssueChangesReason(nil) = %q, want %q", got, ChangesReasonNoCriticalIssues)
+	if got, want := IssueChangesReason(nil), "no_critical_issues"; got != want {
+		t.Fatalf("IssueChangesReason(nil) = %q, want %q", got, want)
 	}
 	baseline := []issuesapi.Issue{{Severity: issuesapi.SeverityCritical, IssueTiming: "started_at_resource_creation"}}
 	if !ShouldAttachIssueChanges(baseline) {
-		t.Fatalf("baseline-dominated critical issues should allow the recent-changes attachment")
+		t.Fatalf("creation-time critical issues should allow the recent-changes attachment")
 	}
-	if got := IssueChangesReason(baseline); got != ChangesReasonAllCriticalStartedAtCreation {
-		t.Fatalf("IssueChangesReason(baseline) = %q, want %q", got, ChangesReasonAllCriticalStartedAtCreation)
+	if got, want := IssueChangesReason(baseline), "recent_changes_with_all_critical_issues_at_creation"; got != want {
+		t.Fatalf("IssueChangesReason(baseline) = %q, want %q", got, want)
 	}
 	runtime := []issuesapi.Issue{{Severity: issuesapi.SeverityCritical, IssueTiming: "started_after_resource_was_healthy"}}
 	if ShouldAttachIssueChanges(runtime) {
@@ -39,12 +39,42 @@ func TestShouldAttachIssueChanges(t *testing.T) {
 	if got := IssueChangesReason(runtime); got != "" {
 		t.Fatalf("IssueChangesReason(runtime) = %q, want empty", got)
 	}
+	mixed := append(append([]issuesapi.Issue{}, baseline...), runtime...)
+	if got := IssueChangesReason(mixed); got != "" {
+		t.Fatalf("IssueChangesReason(mixed) = %q, want empty", got)
+	}
 	unknown := []issuesapi.Issue{{Severity: issuesapi.SeverityCritical}}
 	if ShouldAttachIssueChanges(unknown) {
 		t.Fatalf("critical issue with unknown timing should suppress the recent-changes attachment")
 	}
 	if got := IssueChangesReason(unknown); got != "" {
 		t.Fatalf("IssueChangesReason(unknown) = %q, want empty", got)
+	}
+}
+
+// The creation-timing collision is the exact spot where the old dismissive
+// token steered agents away from the change feed; the guidance must ride that
+// reason and no other, and must steer without claiming causation.
+func TestIssueChangesGuidance(t *testing.T) {
+	guidance := IssueChangesGuidance(ChangesReasonWithAllCreationTimeCriticalIssues)
+	if !strings.Contains(guidance, "does not clear the listed changes") || !strings.Contains(guidance, "Review the changes") {
+		t.Fatalf("collision-reason guidance must steer toward the feed, got %q", guidance)
+	}
+	if strings.Contains(strings.ToLower(guidance), "caused the") {
+		t.Fatalf("guidance must not claim causation, got %q", guidance)
+	}
+	// The timing classification is per-resource ("failing since creation"); it
+	// establishes no ordering against the change feed, so the prose must never
+	// claim the issues predate the changes — a resource created after a bad
+	// change fails from creation because of that change.
+	if strings.Contains(strings.ToLower(guidance), "predate") {
+		t.Fatalf("guidance must not claim an issue-vs-change ordering, got %q", guidance)
+	}
+	if got := IssueChangesGuidance(ChangesReasonNoCriticalIssues); got != "" {
+		t.Fatalf("no_critical_issues carries no landmine and needs no guidance, got %q", got)
+	}
+	if got := IssueChangesGuidance(""); got != "" {
+		t.Fatalf("empty reason must yield empty guidance, got %q", got)
 	}
 }
 

@@ -182,7 +182,14 @@ func registerTools(server *mcp.Server, includeWrites bool) {
 			"resourceContext (managedBy, exposes, selectedBy, uses, runsOn, " +
 			"issue/audit/policy rollups — issues carry diagnostic_context with cross-subject " +
 			"causal links + a confidence tier to walk symptom→root) + current AND previous container logs across the " +
-			"workload's pods + recent Warning events filtered to this resource + a " +
+			"workload's pods + crashCause evidence that pairs active crashloop status with " +
+			"one highest-signal line from the crashed instance's already-filtered logs " +
+			"(evidence, not a root-cause verdict; its logLineSelection field states how the " +
+			"line was chosen — fatal_pattern, traceback_header_only, last_matched_line, " +
+			"log_tail, in descending confidence — weigh the line accordingly and read the " +
+			"full logs when confidence is low; traceback_header_only means a crash " +
+			"signature exists but its informative line was not captured) + recent Warning " +
+			"events filtered to this resource + a " +
 			"recentChanges section for the workload and directly referenced " +
 			"ConfigMaps (no Secret content) + a " +
 			"startupBlockers section when the workload can't reach Running (unschedulable " +
